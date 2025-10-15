@@ -1,10 +1,10 @@
 # src/anycubic_nfc_qt5/app.py
 import sys
+import time
 from PyQt5 import QtWidgets, QtGui, QtCore
-from .config.filaments import load_filaments
 from importlib import resources
+from .config.filaments import load_filaments
 from anycubic_nfc_qt5.nfc.pcsc import list_readers, connect_first_reader, read_atr, read_uid
-
 
 PLACEHOLDER_FILAMENT = "select filament"
 PLACEHOLDER_COLOR = "select color"
@@ -13,11 +13,9 @@ def set_placeholder(combo: QtWidgets.QComboBox, text: str):
     """Insert a disabled, non-selectable first item as placeholder."""
     combo.clear()
     combo.addItem(text)
-    # disable/select-block the placeholder row
     m = combo.model()
     idx = m.index(0, 0)
     m.setData(idx, 0, QtCore.Qt.UserRole - 1)  # disable
-    # QComboBox uses QStandardItemModel by default, so this is safe:
     it = getattr(m, "item", None)
     if callable(it):
         item0 = m.item(0)
@@ -31,11 +29,10 @@ def normalize_hex(hex_str: str) -> str:
     s = (hex_str or "").strip()
     if not s.startswith("#"):
         return "#000000"
-    if len(s) >= 9:  # '#RRGGBBAA' -> take first 7 chars
+    if len(s) >= 9:
         return s[:7]
     if len(s) == 7:
         return s
-    # Fallback if malformed
     return "#000000"
 
 class ColorDot(QtWidgets.QWidget):
@@ -43,7 +40,7 @@ class ColorDot(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._color = QtGui.QColor("#000000")
-        self.setFixedSize(22, 22)  # small round indicator
+        self.setFixedSize(22, 22)
 
     def set_color_hex(self, hex_str: str):
         """Set color from '#RRGGBB' string."""
@@ -51,7 +48,6 @@ class ColorDot(QtWidgets.QWidget):
         self.update()
 
     def paintEvent(self, event):
-        # Draw a filled circle with a thin border
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         r = self.rect().adjusted(2, 2, -2, -2)
@@ -59,71 +55,6 @@ class ColorDot(QtWidgets.QWidget):
         p.setBrush(QtGui.QBrush(self._color))
         p.drawEllipse(r)
         p.end()
-
-class NFCWorker(QtCore.QThread):
-    """Background worker that polls the first PC/SC reader and detects card presence."""
-    readerStateChanged = QtCore.pyqtSignal(bool)                 # True = connected (card present), False = no card
-    cardDetected = QtCore.pyqtSignal(bytes, object)              # atr: bytes, uid: Optional[bytes]
-
-    def __init__(self, parent=None, poll_interval_ms: int = 700):
-        super().__init__(parent)
-        self._running = True
-        self._poll_interval_ms = poll_interval_ms
-
-    def stop(self):
-        """Stop the thread loop gracefully."""
-        self._running = False
-
-    def run(self):
-        """Poll for card presence; emit signals on state change and when a card is detected."""
-        was_connected = False
-        while self._running:
-            try:
-                # No reader available?
-                if not list_readers():
-                    if was_connected:
-                        self.readerStateChanged.emit(False)
-                        was_connected = False
-                    self.msleep(self._poll_interval_ms)
-                    continue
-
-                # Try to connect to first reader; success means a card is present
-                conn = connect_first_reader()
-                if conn is None:
-                    if was_connected:
-                        self.readerStateChanged.emit(False)
-                        was_connected = False
-                    self.msleep(self._poll_interval_ms)
-                    continue
-
-                try:
-                    conn.connect()
-                    # Card present
-                    if not was_connected:
-                        self.readerStateChanged.emit(True)
-                        was_connected = True
-
-                    atr = read_atr(conn) or b""
-                    uid, sw1, sw2 = read_uid(conn)  # may be (None, sw1, sw2)
-                    self.cardDetected.emit(atr, uid)
-
-                except Exception:
-                    # No card / connect failed
-                    if was_connected:
-                        self.readerStateChanged.emit(False)
-                        was_connected = False
-
-                finally:
-                    try:
-                        conn.disconnect()
-                    except Exception:
-                        pass
-
-            except Exception:
-                # Any unexpected error → wait and continue
-                pass
-
-            self.msleep(self._poll_interval_ms)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -134,17 +65,29 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        # === NFC Icon ===
+        # === NFC Icon + Refresh ===
+        icon_row = QtWidgets.QHBoxLayout()
+        layout.addLayout(icon_row)
+        icon_row.addStretch()
         self.icon_label = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
         self.icon_label.setMinimumHeight(120)
-        layout.addWidget(self.icon_label)
+        icon_row.addWidget(self.icon_label)
+        self.btn_refresh = QtWidgets.QToolButton()
+        self.btn_refresh.setText("Refresh")
+        self.btn_refresh.setToolTip("Refresh reader status")
+        self.btn_refresh.clicked.connect(self.refresh_reader_status)
+        icon_row.addWidget(self.btn_refresh)
+        icon_row.addStretch()
 
         # Load icons from packaged resources
         self.icons = {}
         for state, fname in {
-            "red": "nfc_red.png",
-            "green": "nfc_green.png",
+            "black": "nfc_black.png",  # no reader connected
+            "red":   "nfc_red.png",    # reader present, no card
+            "green": "nfc_green.png",  # card detected (on-demand)
         }.items():
             try:
                 data = resources.files("anycubic_nfc_qt5.ui.resources").joinpath(fname).read_bytes()
@@ -153,7 +96,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.icons[state] = pm
             except Exception as e:
                 print(f"[WARN] Could not load {fname}: {e}")
-        self.set_reader_connected(False)  # start state
+
+        # internal state
+        self._icon_state = "black"
+        self._green_hold_until = 0.0
+        self.reader_available = False
 
         # === Selection row ===
         row = QtWidgets.QHBoxLayout()
@@ -164,31 +111,31 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(left_box, 1)
         row.addWidget(right_box, 1)
 
-        # Left side: filament combo
+        # Left: filament combo
         self.combo_filament = QtWidgets.QComboBox()
         v_left = QtWidgets.QVBoxLayout(left_box)
         v_left.addWidget(self.combo_filament)
 
-        # Right side: color combo + color dot + hex label
+        # Right: color combo + color dot + hex label
         self.combo_color = QtWidgets.QComboBox()
         self.color_dot = ColorDot()
-        self.color_hex_label = QtWidgets.QLabel("")  # shows '#RRGGBB'
-
+        self.color_hex_label = QtWidgets.QLabel("")
         right_row = QtWidgets.QHBoxLayout()
         right_row.addWidget(self.combo_color, 1)
         right_row.addWidget(self.color_dot, 0, QtCore.Qt.AlignVCenter)
         right_row.addWidget(self.color_hex_label, 0, QtCore.Qt.AlignVCenter)
-
         v_right = QtWidgets.QVBoxLayout(right_box)
         v_right.addLayout(right_row)
 
         # === SKU Display (prominent) ===
         self.sku_label = QtWidgets.QLabel("", alignment=QtCore.Qt.AlignCenter)
         self.sku_label.setObjectName("skuLabel")
-        # Make it pop: bold + larger font
-        self.sku_label.setStyleSheet("#skuLabel { font-weight: 600; font-size: 18px; }")
+        f = self.sku_label.font()
+        f.setBold(True)
+        f.setPointSize(f.pointSize() + 4)
+        self.sku_label.setFont(f)
         self.sku_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(self.sku_label)
+        layout.addWidget(self.sku_label, 0, QtCore.Qt.AlignHCenter)
 
         # === Buttons row ===
         btn_row = QtWidgets.QHBoxLayout()
@@ -204,70 +151,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output = QtWidgets.QPlainTextEdit()
         self.output.setReadOnly(True)
         layout.addWidget(self.output)
+        self.statusBar().showMessage("Ready")
 
-        # placeholders first
+        # placeholders
         set_placeholder(self.combo_filament, PLACEHOLDER_FILAMENT)
         set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
         self.combo_color.setEnabled(False)
         self._set_color_indicator(None)
 
-        self.statusBar().showMessage("Ready")
-
         # Load filaments
         try:
             self.by_filament, self.by_sku = load_filaments(None)
             names = sorted(self.by_filament.keys(), key=str.casefold)
-            # append items AFTER placeholder
             for name in names:
                 self.combo_filament.addItem(name)
             self.log(f"Loaded {sum(len(v) for v in self.by_filament.values())} filament records.")
         except Exception as e:
             self.log(f"[Error] Failed to load filaments: {e}")
 
-        # --- Signals ---
+        # Signals
         self.combo_filament.currentTextChanged.connect(self.on_filament_changed)
         self.combo_color.currentTextChanged.connect(self.on_color_changed)
         self.btn_read.clicked.connect(self.on_read)
         self.btn_write.clicked.connect(self.on_write)
+        self.btn_refresh.clicked.connect(self.refresh_reader_status)
 
-        # --- NFC worker (real reader status) ---
-        self.reader_connected = False
-        self.nfc_worker = NFCWorker(self)
-        self.nfc_worker.readerStateChanged.connect(self.on_reader_state_changed)
-        self.nfc_worker.cardDetected.connect(self.on_card_detected)
-        self.nfc_worker.start()
+        # Initial reader status + auto-refresh (no card polling)
+        self.refresh_reader_status()
+        self.reader_timer = QtCore.QTimer(self)
+        self.reader_timer.setInterval(2000)           # only checks list_readers()
+        self.reader_timer.timeout.connect(self.refresh_reader_status)
+        self.reader_timer.start()
 
         self._update_actions()
 
     # === UI Helpers ===
+    def set_icon_state(self, key: str):
+        """Set icon by state key: 'black' (no reader), 'red' (reader no card), 'green' (card)."""
+        pix = self.icons.get(key)
+        if not pix or pix.isNull():
+            self.icon_label.setText("[missing icon]")
+            return
+        self.icon_label.setPixmap(pix.scaledToWidth(100, QtCore.Qt.SmoothTransformation))
+        self._icon_state = key
+
+    def refresh_reader_status(self):
+        """Detect reader presence once and update UI (icon + buttons)."""
+        self.reader_available = bool(list_readers())
+        if not self.reader_available:
+            if self._green_hold_until <= time.time():
+                self.set_icon_state("black")
+        else:
+            if self._green_hold_until <= time.time():
+                self.set_icon_state("red")
+        self._update_actions()
 
     def _set_sku(self, sku: str | None):
         """Update prominent SKU label."""
         self.sku_label.setText(f"SKU: {sku}" if sku else "")
 
-    def set_reader_connected(self, state: bool):
-        """Show the correct colored NFC icon."""
-        pix = self.icons.get("green" if state else "red")
-        if not pix or pix.isNull():
-            self.icon_label.setText("[missing icon]")
-            return
-        self.icon_label.setPixmap(pix.scaledToWidth(100, QtCore.Qt.SmoothTransformation))
-
-    def _check_reader_state(self):
-        """Simulate: toggle connection status (for now)."""
-        self.reader_connected = not self.reader_connected
-        self.set_reader_connected(self.reader_connected)
-        self.statusBar().showMessage("Reader connected" if self.reader_connected else "Reader disconnected")
-
     def log(self, msg: str):
         self.output.appendPlainText(msg)
 
     def _update_actions(self):
-        """Enable/disable buttons based on selection state."""
+        """Enable/disable buttons based on selection state and reader availability."""
         filament_ok = self.combo_filament.currentIndex() > 0
         color_ok = self.combo_color.isEnabled() and self.combo_color.currentIndex() > 0
-        self.btn_write.setEnabled(filament_ok and color_ok)
-        self.btn_read.setEnabled(True)
+        reader_ok = self.reader_available
+        self.btn_read.setEnabled(reader_ok)
+        self.btn_write.setEnabled(reader_ok and filament_ok and color_ok)
 
     def _set_color_indicator(self, hex_str: str | None):
         """Update the color dot and hex text (expects '#RRGGBB' or None)."""
@@ -279,19 +231,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.color_dot.set_color_hex(rgb)
         self.color_hex_label.setText(rgb)
 
+    # === Selection handlers ===
     def on_filament_changed(self, filament_name: str):
         """Handle filament selection change."""
         if self.combo_filament.currentIndex() == 0 or filament_name == PLACEHOLDER_FILAMENT:
             set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
             self.combo_color.setEnabled(False)
             self._set_color_indicator(None)
+            self._set_sku(None)
             self._update_actions()
             return
 
         records = self.by_filament.get(filament_name, [])
         self.log(f"Selected filament: {filament_name} ({len(records)} variants)")
 
-        # Build unique color list; store SKU + hex in itemData for later use
         set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
         self.combo_color.setEnabled(True)
         seen = set()
@@ -301,61 +254,74 @@ class MainWindow(QtWidgets.QMainWindow):
                 seen.add(rec.color)
 
         self._set_color_indicator(None)
-        self._set_sku(None)  # <-- reset SKU until a color is chosen
+        self._set_sku(None)
         self._update_actions()
 
     def on_color_changed(self, color_name: str):
         """Update color dot on color selection."""
         if self.combo_color.currentIndex() == 0 or color_name == PLACEHOLDER_COLOR:
             self._set_color_indicator(None)
-            self._set_sku(None)  # <-- reset
+            self._set_sku(None)
             self._update_actions()
             return
         data = self.combo_color.currentData()  # (sku, color_hex)
         if data:
             sku, hex_str = data
             self._set_color_indicator(hex_str)
-            # Optional log:
-            self._set_sku(sku)  # <-- show selected SKU prominently
+            self._set_sku(sku)
             self.log(f"Selected color: {color_name} [{normalize_hex(hex_str)}], SKU={sku}")
         self._update_actions()
 
-    def on_reader_state_changed(self, connected: bool):
-        """Switch icon and status bar when reader/card state changes."""
-        self.reader_connected = connected
-        self.set_reader_connected(connected)
-        self.statusBar().showMessage("Reader connected" if connected else "Reader disconnected")
-
-    def on_card_detected(self, atr: bytes, uid):
-        """Log ATR and optional UID whenever a card is detected."""
-        # Format helper
-        def fmt(b: bytes) -> str:
-            return " ".join(f"{x:02X}" for x in b) if b else "(empty)"
-
-        if atr:
-            self.log(f"[OK] ATR: {fmt(atr)}")
-        if uid is not None:
-            self.log(f"[OK] UID: {fmt(uid)}")
-        else:
-            # UID not available is fine on ACR122U if command unsupported (e.g. SW=6300)
-            self.log("[INFO] UID not available on this reader/card.")
-
-    def closeEvent(self, event: QtGui.QCloseEvent):
-        """Ensure worker is stopped before window closes."""
-        try:
-            if hasattr(self, "nfc_worker") and self.nfc_worker.isRunning():
-                self.nfc_worker.stop()
-                self.nfc_worker.wait(1500)
-        finally:
-            super().closeEvent(event)
-
     # === Buttons ===
     def on_read(self):
-        self.log("[INFO] READ NFC clicked")
+        """On-demand read: try once; set icon accordingly."""
+        self.refresh_reader_status()
+        if not self.reader_available:
+            self.log("[ERROR] No NFC reader connected.")
+            return
+
+        conn = connect_first_reader()
+        if conn is None:
+            self.log("[ERROR] No NFC reader available.")
+            self.reader_available = False
+            self.set_icon_state("black")
+            self._update_actions()
+            return
+
+        try:
+            conn.connect()  # fails if no card
+            self.set_icon_state("green")
+            self._green_hold_until = time.time() + 2.0
+            atr = read_atr(conn) or b""
+            uid, sw1, sw2 = read_uid(conn)
+            if atr:
+                self.log(f"[OK] ATR: {' '.join(f'{x:02X}' for x in atr)}")
+            if uid is not None:
+                self.log(f"[OK] UID: {' '.join(f'{x:02X}' for x in uid)}")
+            else:
+                self.log("[INFO] UID not available on this reader/card.")
+        except Exception:
+            self.set_icon_state("red")
+            self.log("[INFO] No card detected. Place a tag on the reader and try again.")
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+            QtCore.QTimer.singleShot(2100, self.refresh_reader_status)
 
     def on_write(self):
-        self.log("[INFO] WRITE NFC clicked")
-
+        """Guarded write: require reader and valid selections."""
+        self.refresh_reader_status()
+        if not self.reader_available:
+            self.log("[ERROR] No NFC reader connected.")
+            return
+        filament_ok = self.combo_filament.currentIndex() > 0
+        color_ok = self.combo_color.isEnabled() and self.combo_color.currentIndex() > 0
+        if not (filament_ok and color_ok):
+            self.log("[INFO] Please select filament and color before writing.")
+            return
+        self.log("[INFO] WRITE NFC clicked (write logic not implemented yet)")
 
 def run_app():
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
