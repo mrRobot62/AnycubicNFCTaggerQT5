@@ -17,4 +17,7 @@ src/anycubic_nfc_qt5/nfc/NFCManager.py
 src/anycubic_nfc_qt5/nfc/__init__.py
 src/anycubic_nfc_qt5/nfc/backend.py
 src/anycubic_nfc_qt5/ui/__init__.py
+src/anycubic_nfc_qt5/ui/resources/nfc_black.png
+src/anycubic_nfc_qt5/ui/resources/nfc_green.png
+src/anycubic_nfc_qt5/ui/resources/nfc_red.png
 tests/test_smoke.py

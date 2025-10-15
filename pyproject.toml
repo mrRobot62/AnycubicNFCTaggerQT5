@@ -31,7 +31,13 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-anycubic_nfc_qt5 = ["config/ac_filaments.ini"]
+anycubic_nfc_qt5 = [
+  "config/ac_filaments.ini",
+  "ui/resources/nfc_black.png",
+  "ui/resources/nfc_green.png",
+  "ui/resources/nfc_red.png"
+]  
+
 
 # Falls du Paketdaten ohne MANIFEST.in einbinden willst:
 # [tool.setuptools.package-data]
