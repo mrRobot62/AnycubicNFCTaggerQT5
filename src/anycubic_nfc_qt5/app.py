@@ -6,6 +6,9 @@ from importlib import resources
 from .config.filaments import load_filaments
 from anycubic_nfc_qt5.nfc.pcsc import list_readers, connect_first_reader, read_atr, read_uid
 
+# pyscard presence monitor (no APDU, just insert/remove)
+from smartcard.CardMonitoring import CardMonitor, CardObserver
+
 PLACEHOLDER_FILAMENT = "select filament"
 PLACEHOLDER_COLOR = "select color"
 
@@ -56,6 +59,25 @@ class ColorDot(QtWidgets.QWidget):
         p.drawEllipse(r)
         p.end()
 
+# ---------- Card presence monitor (no reading) ----------
+class _QtPresenceBridge(QtCore.QObject):
+    """Qt bridge object to emit signals from CardObserver callbacks (which run in a background thread)."""
+    presenceChanged = QtCore.pyqtSignal(bool)  # True = card present, False = removed
+
+class _CardPresenceObserver(CardObserver):
+    """pyscard CardObserver that forwards insert/remove events to Qt via a bridge."""
+    def __init__(self, bridge: _QtPresenceBridge):
+        super().__init__()
+        self._bridge = bridge
+
+    def update(self, observable, actions):
+        """Called by pyscard on card inserted/removed."""
+        (added, removed) = actions
+        if added and len(added) > 0:
+            self._bridge.presenceChanged.emit(True)
+        if removed and len(removed) > 0:
+            self._bridge.presenceChanged.emit(False)
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -87,7 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for state, fname in {
             "black": "nfc_black.png",  # no reader connected
             "red":   "nfc_red.png",    # reader present, no card
-            "green": "nfc_green.png",  # card detected (on-demand)
+            "green": "nfc_green.png",  # card present (presence monitor)
         }.items():
             try:
                 data = resources.files("anycubic_nfc_qt5.ui.resources").joinpath(fname).read_bytes()
@@ -99,8 +121,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # internal state
         self._icon_state = "black"
-        self._green_hold_until = 0.0
         self.reader_available = False
+        self.card_present = False
 
         # === Selection row ===
         row = QtWidgets.QHBoxLayout()
@@ -176,18 +198,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_write.clicked.connect(self.on_write)
         self.btn_refresh.clicked.connect(self.refresh_reader_status)
 
-        # Initial reader status + auto-refresh (no card polling)
+        # Initial reader status + auto-refresh (no APDUs)
         self.refresh_reader_status()
         self.reader_timer = QtCore.QTimer(self)
         self.reader_timer.setInterval(2000)           # only checks list_readers()
         self.reader_timer.timeout.connect(self.refresh_reader_status)
         self.reader_timer.start()
 
+        # Start presence monitor (no reading) → toggles green/red
+        self._presence_bridge = _QtPresenceBridge()
+        self._presence_bridge.presenceChanged.connect(self.on_card_presence_changed)
+        self._card_monitor = CardMonitor()
+        self._presence_observer = _CardPresenceObserver(self._presence_bridge)
+        self._card_monitor.addObserver(self._presence_observer)
+
         self._update_actions()
 
     # === UI Helpers ===
     def set_icon_state(self, key: str):
-        """Set icon by state key: 'black' (no reader), 'red' (reader no card), 'green' (card)."""
+        """Set icon by state key: 'black' (no reader), 'red' (reader no card), 'green' (card present)."""
         pix = self.icons.get(key)
         if not pix or pix.isNull():
             self.icon_label.setText("[missing icon]")
@@ -199,11 +228,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """Detect reader presence once and update UI (icon + buttons)."""
         self.reader_available = bool(list_readers())
         if not self.reader_available:
-            if self._green_hold_until <= time.time():
-                self.set_icon_state("black")
+            self.card_present = False
+            self.set_icon_state("black")
         else:
-            if self._green_hold_until <= time.time():
-                self.set_icon_state("red")
+            # If a card is present (from presence monitor), keep green; otherwise red
+            self.set_icon_state("green" if self.card_present else "red")
         self._update_actions()
 
     def _set_sku(self, sku: str | None):
@@ -214,12 +243,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output.appendPlainText(msg)
 
     def _update_actions(self):
-        """Enable/disable buttons based on selection state and reader availability."""
+        """Enable/disable buttons based on selection state and reader/card availability."""
         filament_ok = self.combo_filament.currentIndex() > 0
         color_ok = self.combo_color.isEnabled() and self.combo_color.currentIndex() > 0
         reader_ok = self.reader_available
+        card_ok = getattr(self, "card_present", False)
+
+        # READ: nur Reader nötig
         self.btn_read.setEnabled(reader_ok)
-        self.btn_write.setEnabled(reader_ok and filament_ok and color_ok)
+
+        # WRITE: Reader + Karte + gültige Auswahl
+        self.btn_write.setEnabled(reader_ok and card_ok and filament_ok and color_ok)
 
     def _set_color_indicator(self, hex_str: str | None):
         """Update the color dot and hex text (expects '#RRGGBB' or None)."""
@@ -230,6 +264,18 @@ class MainWindow(QtWidgets.QMainWindow):
         rgb = normalize_hex(hex_str)
         self.color_dot.set_color_hex(rgb)
         self.color_hex_label.setText(rgb)
+
+    # === Presence callback (no reading) ===
+    @QtCore.pyqtSlot(bool)
+    def on_card_presence_changed(self, present: bool):
+        """React to card insert/remove events without reading any data."""
+        self.card_present = present
+        if not self.reader_available:
+            # Reader might be unplugged; keep black
+            self.set_icon_state("black")
+        else:
+            self.set_icon_state("green" if present else "red")
+        self._update_actions()  
 
     # === Selection handlers ===
     def on_filament_changed(self, filament_name: str):
@@ -274,7 +320,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # === Buttons ===
     def on_read(self):
-        """On-demand read: try once; set icon accordingly."""
+        """On-demand read: try once; set icon accordingly and log ATR/UID."""
         self.refresh_reader_status()
         if not self.reader_available:
             self.log("[ERROR] No NFC reader connected.")
@@ -289,9 +335,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            conn.connect()  # fails if no card
-            self.set_icon_state("green")
-            self._green_hold_until = time.time() + 2.0
+            conn.connect()  # fails if no card present
+            # Icon is already green from presence monitor if a card is present.
             atr = read_atr(conn) or b""
             uid, sw1, sw2 = read_uid(conn)
             if atr:
@@ -301,14 +346,16 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.log("[INFO] UID not available on this reader/card.")
         except Exception:
-            self.set_icon_state("red")
+            # No card on it → ensure red (unless reader gone)
+            if self.reader_available:
+                self.set_icon_state("red")
             self.log("[INFO] No card detected. Place a tag on the reader and try again.")
         finally:
             try:
                 conn.disconnect()
             except Exception:
                 pass
-            QtCore.QTimer.singleShot(2100, self.refresh_reader_status)
+            # Reader status will keep being updated by presence monitor / refresh
 
     def on_write(self):
         """Guarded write: require reader and valid selections."""
@@ -322,6 +369,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("[INFO] Please select filament and color before writing.")
             return
         self.log("[INFO] WRITE NFC clicked (write logic not implemented yet)")
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        """Detach presence observer on close."""
+        try:
+            if hasattr(self, "_card_monitor") and hasattr(self, "_presence_observer"):
+                try:
+                    self._card_monitor.deleteObserver(self._presence_observer)
+                except Exception:
+                    pass
+        finally:
+            super().closeEvent(event)
 
 def run_app():
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
