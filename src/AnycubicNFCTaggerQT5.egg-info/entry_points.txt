@@ -1,0 +1,2 @@
+[gui_scripts]
+AnycubicNFCTaggerQT5 = anycubic_nfc_qt5.app:run_app
