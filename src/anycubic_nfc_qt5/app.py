@@ -5,6 +5,23 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 from .config.filaments import load_filaments
 from importlib import resources
 
+PLACEHOLDER_FILAMENT = "select filament"
+PLACEHOLDER_COLOR = "select color"
+
+def set_placeholder(combo: QtWidgets.QComboBox, text: str):
+    """Insert a disabled, non-selectable first item as placeholder."""
+    combo.clear()
+    combo.addItem(text)
+    # disable/select-block the placeholder row
+    m = combo.model()
+    idx = m.index(0, 0)
+    m.setData(idx, 0, QtCore.Qt.UserRole - 1)  # disable
+    # If using QStandardItemModel, also:
+    it = m.item(0)
+    if it:
+        it.setEnabled(False)
+        it.setSelectable(False)
+    combo.setCurrentIndex(0)
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -25,8 +42,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for state, fname in {
             "red": "nfc_red.png",
             "green": "nfc_green.png",
-            "gray": "nfc_gray.png",
-        }.items():
+         }.items():
             try:
                 data = resources.files("anycubic_nfc_qt5.ui.resources").joinpath(fname).read_bytes()
                 pm = QtGui.QPixmap()
@@ -70,6 +86,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output.setReadOnly(True)
         layout.addWidget(self.output)
 
+        # placeholders first
+        set_placeholder(self.combo_filament, PLACEHOLDER_FILAMENT)
+        set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
+        self.combo_color.setEnabled(False)
+
+
         self.statusBar().showMessage("Ready")
 
         # Load filaments
@@ -77,6 +99,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.by_filament, self.by_sku = load_filaments(None)
             names = sorted(self.by_filament.keys(), key=str.casefold)
             self.combo_filament.addItems(names)
+
+            # keep placeholder at index 0, append real items after it
+            for name in names:
+                self.combo_filament.addItem(name)
+
             self.log(f"Loaded {sum(len(v) for v in self.by_filament.values())} filament records.")
         except Exception as e:
             self.log(f"[Error] Failed to load filaments: {e}")
@@ -110,12 +137,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def log(self, msg: str):
         self.output.appendPlainText(msg)
 
-    # === Step 1 callbacks ===
+    def _update_actions(self):
+        """Enable/disable buttons based on selection state."""
+        filament_ok = self.combo_filament.currentIndex() > 0
+        color_ok = self.combo_color.isEnabled() and self.combo_color.currentIndex() > 0
+        self.btn_write.setEnabled(filament_ok and color_ok)
+        self.btn_read.setEnabled(True)
+
     def on_filament_changed(self, filament_name: str):
-        if not filament_name:
+        """Handle filament selection change."""
+        if self.combo_filament.currentIndex() == 0 or filament_name == PLACEHOLDER_FILAMENT:
+            set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
+            self.combo_color.setEnabled(False)
+            self._update_actions()
             return
+
         records = self.by_filament.get(filament_name, [])
         self.log(f"Selected filament: {filament_name} ({len(records)} variants)")
+
+        # prepare color combo (for Step 2)
+        set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
+        self.combo_color.setEnabled(True)
+        for rec in records:
+            self.combo_color.addItem(rec.color, rec.sku)
+
+        self._update_actions()
 
     # === Step 2 placeholder buttons ===
     def on_read(self):
