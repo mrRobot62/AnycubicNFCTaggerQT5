@@ -1,16 +1,26 @@
 # src/anycubic_nfc_qt5/app.py
 import sys
 import time
+import re
 from PyQt5 import QtWidgets, QtGui, QtCore
 from importlib import resources
 from .config.filaments import load_filaments
 from anycubic_nfc_qt5.nfc.pcsc import list_readers, connect_first_reader, read_atr, read_uid
+from anycubic_nfc_qt5.nfc.pcsc import read_anycubic_fields, interpret_anycubic
 
 # pyscard presence monitor (no APDU, just insert/remove)
 from smartcard.CardMonitoring import CardMonitor, CardObserver
 
 PLACEHOLDER_FILAMENT = "select filament"
 PLACEHOLDER_COLOR = "select color"
+
+def sku_base(sku: str) -> str:
+    """Return alphanumeric part before '-', e.g. 'AHHSCG-101' -> 'AHHSCG'."""
+    if not sku:
+        return ""
+    # take substring before first '-' and keep only A–Z, a–z, 0–9
+    head = sku.split("-", 1)[0]
+    return re.sub(r"[^A-Za-z0-9]", "", head)
 
 def set_placeholder(combo: QtWidgets.QComboBox, text: str):
     """Insert a disabled, non-selectable first item as placeholder."""
@@ -170,9 +180,19 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row.addStretch()
 
         # === Log output ===
+        log_row = QtWidgets.QHBoxLayout()
         self.output = QtWidgets.QPlainTextEdit()
         self.output.setReadOnly(True)
-        layout.addWidget(self.output)
+
+        self.btn_clear_log = QtWidgets.QToolButton()
+        self.btn_clear_log.setText("Clear Log")
+        self.btn_clear_log.setToolTip("Clear the log window")
+        self.btn_clear_log.clicked.connect(self.clear_log)
+
+        log_row.addWidget(self.output, 1)
+        log_row.addWidget(self.btn_clear_log, 0, QtCore.Qt.AlignTop)
+
+        layout.addLayout(log_row)
         self.statusBar().showMessage("Ready")
 
         # placeholders
@@ -215,6 +235,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_actions()
 
     # === UI Helpers ===
+
+    def clear_log(self):
+        """Clear the text log."""
+        self.output.clear()
+
     def set_icon_state(self, key: str):
         """Set icon by state key: 'black' (no reader), 'red' (reader no card), 'green' (card present)."""
         pix = self.icons.get(key)
@@ -264,6 +289,47 @@ class MainWindow(QtWidgets.QMainWindow):
         rgb = normalize_hex(hex_str)
         self.color_dot.set_color_hex(rgb)
         self.color_hex_label.setText(rgb)
+
+    def _select_by_sku(self, sku_read: str) -> bool:
+        """Try to preselect filament and color based on SKU (prefers exact match; falls back to base)."""
+        # 1) exakte Full-SKU
+        rec = self.by_sku.get(sku_read)
+        chosen = rec
+
+        # 2) Fallback: über SKU-Basis
+        if not chosen:
+            base = sku_base(sku_read)
+            if base:
+                # finde *irgendeinen* Eintrag, dessen SKU mit 'BASE-' beginnt
+                for r_sku, r in self.by_sku.items():
+                    if r_sku.startswith(base + "-"):
+                        chosen = r
+                        break
+
+        if not chosen:
+            self.log(f"[INFO] Keine passende Konfiguration für SKU '{sku_read}' (Basis='{sku_base(sku_read)}') gefunden.")
+            return False
+
+        # Filament auswählen
+        filament_name = chosen.filament
+        idx_f = self.combo_filament.findText(filament_name, QtCore.Qt.MatchFixedString)
+        if idx_f <= 0:
+            self.log(f"[INFO] Filament '{filament_name}' nicht in Liste gefunden.")
+            return False
+        self.combo_filament.setCurrentIndex(idx_f)  # triggert on_filament_changed(), baut Color-Liste
+
+        # Farbe auswählen (Items: Text=color, Data=(sku, hex))
+        color_name = chosen.color
+        for i in range(1, self.combo_color.count()):
+            if self.combo_color.itemText(i) == color_name:
+                self.combo_color.setCurrentIndex(i)
+                break
+        else:
+            self.log(f"[INFO] Farbe '{color_name}' nicht in Liste für '{filament_name}'.")
+            return False
+
+        return True
+
 
     # === Presence callback (no reading) ===
     @QtCore.pyqtSlot(bool)
@@ -345,6 +411,41 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log(f"[OK] UID: {' '.join(f'{x:02X}' for x in uid)}")
             else:
                 self.log("[INFO] UID not available on this reader/card.")
+
+            info = read_anycubic_fields(conn)
+            self._last_read_full_sku = info.get("sku") or ""
+            nice = interpret_anycubic(info)
+
+            sku = info.get("sku") or ""
+            mat = info.get("material") or ""
+
+            if sku:
+                self._set_sku(sku)
+                self.log(f"[OK] SKU: {sku}")
+                self._last_read_full_sku = info.get("sku") or ""
+                # Optional: Filament/Color automatisch setzen, falls vorhanden
+                if self._select_by_sku(sku):
+                    self.log("[OK] Vorauswahl per SKU gesetzt (Filament & Color).")
+            else:
+                self.log("[INFO] Keine SKU erkannt.")
+
+            if mat:
+                self.log(f"[OK] Material: {mat}")
+
+            fr = nice.get("friendly", {})
+            if "filament_diameter_mm" in fr:
+                self.log(f"[OK] Filament Ø: {fr['filament_diameter_mm']:.2f} mm")
+            if "nozzle_temp_min_c" in fr and "nozzle_temp_max_c" in fr:
+                self.log(f"[OK] Nozzle-Temp: {fr['nozzle_temp_min_c']}–{fr['nozzle_temp_max_c']} °C")
+            if "bed_temp_min_c" in fr and "bed_temp_max_c" in fr:
+                self.log(f"[OK] Bed-Temp: {fr['bed_temp_min_c']}–{fr['bed_temp_max_c']} °C")
+            if "spool_weight_g" in fr and "spool_weight_kg" in fr:
+                self.log(f"[OK] Spulen-Gewicht: {fr['spool_weight_g']} g ({fr['spool_weight_kg']:.3f} kg)")
+            if "unknown_p30_b" in fr:
+                self.log(f"[DBG] p30_b (unbekannt): {fr['unknown_p30_b']}")
+
+
+
         except Exception:
             # No card on it → ensure red (unless reader gone)
             if self.reader_available:
