@@ -4,7 +4,7 @@ NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubi
 - **NOTE** : Version 0.1 is not able to write NFC-Tags - it's under construction
 
 ## No Reader found 
-- initial screen
+- initial screen, reader not connected via USB
 <img width="624" height="453" alt="image" src="https://github.com/user-attachments/assets/69862b39-8710-4ed2-80ac-509286d2cd52" />
 
 ## Reader found, no NFC Tag available
