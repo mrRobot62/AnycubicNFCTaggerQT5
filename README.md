@@ -47,6 +47,9 @@ If a BambuLab owner is reading this and want to help - below a description how t
   - change to your installation folder and call `python tests/ntag_dump.py`
   - place an NFC-Tag (filament role) on your reader - or move reader around your role
   - result should be like this
+
+**BTW**:
+What we see in the dump is 45 Pages as 4 bytes = 180Bytes raw data size for this chip. That's a common NFC-Tag
   
 ```
 00: 1D 72 F5 12   |.r..|
