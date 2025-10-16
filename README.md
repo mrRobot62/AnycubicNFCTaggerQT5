@@ -45,8 +45,7 @@ If a BambuLab owner is reading this and want to help - below a description how t
   -- change to your installation folder and call `python tests/ntag_dump.py` 
   -- place an NFC-Tag (filament role) on your reader - or move reader around your role
   -- result should be like this
-  ```
-(base) bernhardklein@MacBookAir AnycubicNFCTaggerQT5 % python tests/ntag_dump.py
+```
 00: 1D 72 F5 12   |.r..|
 01: 61 0F 10 80   |a...|
 02: FE C0 00 00   |....|
