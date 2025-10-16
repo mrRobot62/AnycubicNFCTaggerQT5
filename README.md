@@ -34,17 +34,20 @@ Therefore, it doesn't matter what temperatures, etc. you write on the NFC tag, a
 # Further researches on BambuLab machines
 It would be interesting to analyze if BambuLab NFC-Tags works in the same manner as Anycubic.
 I read that BambuLab use RFID recognition for their filaments/loader. NFC is a sub group of RFID. So maybe it could be possible that.....
+Anycubic write data as bytestream and not into ndef area, so I assume Bambulab do the same.
 
 If a BambuLab owner is reading this and want to help - below a description how to help
 
 ## generating a Byte-Dump from tag
+
 - download this software and install
 - do not start the AnycubicNFCTaggerQT5 app, instead use a raw-dump test routine
-  -- available inside tests-folder
-  -- use an NFC-Reader
-  -- change to your installation folder and call `python tests/ntag_dump.py` 
-  -- place an NFC-Tag (filament role) on your reader - or move reader around your role
-  -- result should be like this
+  -  available inside tests-folder
+  -  use an NFC-Reader
+  - change to your installation folder and call `python tests/ntag_dump.py`
+  - place an NFC-Tag (filament role) on your reader - or move reader around your role
+  - result should be like this
+  
 ```
 00: 1D 72 F5 12   |.r..|
 01: 61 0F 10 80   |a...|
@@ -95,6 +98,9 @@ If a BambuLab owner is reading this and want to help - below a description how t
 46: READ ERROR
 47: READ ERROR
 ```
+
+I made a quick view inside Bambulab's website (different implementation as from AC :-/). What I found for filaments are this indicators
+`:[{\"propertyValueId\":\"593611223076515843\"` => and is for PLA Basic WHITE
 
 # Install
 ## prepare virutal environment
