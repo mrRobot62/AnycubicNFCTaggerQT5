@@ -20,6 +20,17 @@ NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubi
 - Read a "new" Anycubic filament color and update internal filament/color configuration
   <img width="631" height="640" alt="image" src="https://github.com/user-attachments/assets/da504bb1-3018-4c2a-8e9b-6d9219aa4adf" />
 
+# My subjective researches
+Regardless of what you write on the NFC tag, it appears that the ACE Pro only requires the SKU and, if necessary, the color code. Neither temperatures nor other information are transmitted from the ACE Pro to the slicer.
+
+I have also found that only Anycubic SKUs can be used, as the ACE Pro only “understands” these.
+
+## Consequence:
+Even if you want to mark your own filaments with an NFC tag, you have to choose an Anycubic SKU.
+This information is then also transmitted to the slicer. The slicer then selects an Anycubic filament template.
+
+Therefore, it doesn't matter what temperatures, etc. you write on the NFC tag, as you cannot influence the slicer with it. May usefull to store your individual filament configuration for "this" filament/color for later using
+
 # Install
 ## prepare virutal environment
 `python -m venv .venv`
