@@ -2,25 +2,56 @@
 import sys
 import time
 import re
+from pathlib import Path
 from PyQt5 import QtWidgets, QtGui, QtCore
 from importlib import resources
+from smartcard.Exceptions import NoCardException
+
 from .config.filaments import load_filaments
-from anycubic_nfc_qt5.nfc.pcsc import list_readers, connect_first_reader, read_atr, read_uid
-from anycubic_nfc_qt5.nfc.pcsc import read_anycubic_fields, interpret_anycubic
+from anycubic_nfc_qt5.nfc.pcsc import (
+    list_readers,
+    connect_first_reader,
+    read_atr,
+    read_uid,
+    read_anycubic_fields,
+    interpret_anycubic,
+    write_anycubic_basic
+)
 
 # pyscard presence monitor (no APDU, just insert/remove)
 from smartcard.CardMonitoring import CardMonitor, CardObserver
+from smartcard.Exceptions import NoCardException
 
 PLACEHOLDER_FILAMENT = "select filament"
 PLACEHOLDER_COLOR = "select color"
+
+
+# ------------------------- Helpers (module-level) -------------------------
 
 def sku_base(sku: str) -> str:
     """Return alphanumeric part before '-', e.g. 'AHHSCG-101' -> 'AHHSCG'."""
     if not sku:
         return ""
-    # take substring before first '-' and keep only A–Z, a–z, 0–9
     head = sku.split("-", 1)[0]
     return re.sub(r"[^A-Za-z0-9]", "", head)
+
+
+def normalize_hex(hex_str: str) -> str:
+    """Convert '#RRGGBBAA' -> '#RRGGBB'. Keep '#RRGGBB' unchanged."""
+    s = (hex_str or "").strip()
+    if not s.startswith("#"):
+        return "#000000"
+    if len(s) >= 9:
+        return s[:7].upper()
+    if len(s) == 7:
+        return s.upper()
+    return "#000000"
+
+
+def color_core6(hex_str: str) -> str:
+    """Return '#RRGGBB' uppercase for comparisons (drop alpha)."""
+    return normalize_hex(hex_str).upper()
+
 
 def set_placeholder(combo: QtWidgets.QComboBox, text: str):
     """Insert a disabled, non-selectable first item as placeholder."""
@@ -28,7 +59,8 @@ def set_placeholder(combo: QtWidgets.QComboBox, text: str):
     combo.addItem(text)
     m = combo.model()
     idx = m.index(0, 0)
-    m.setData(idx, 0, QtCore.Qt.UserRole - 1)  # disable
+    # disable first item (placeholder)
+    m.setData(idx, 0, QtCore.Qt.UserRole - 1)
     it = getattr(m, "item", None)
     if callable(it):
         item0 = m.item(0)
@@ -37,16 +69,55 @@ def set_placeholder(combo: QtWidgets.QComboBox, text: str):
             item0.setSelectable(False)
     combo.setCurrentIndex(0)
 
-def normalize_hex(hex_str: str) -> str:
-    """Convert '#RRGGBBAA' -> '#RRGGBB'. Keep '#RRGGBB' unchanged."""
-    s = (hex_str or "").strip()
+
+def _normalize_hex_full(h: str) -> str:
+    """Return '#RRGGBBAA' uppercase if possible; accept '#RRGGBB' -> '#RRGGBBFF'."""
+    s = (h or "").strip()
     if not s.startswith("#"):
-        return "#000000"
-    if len(s) >= 9:
-        return s[:7]
+        return "#000000FF"
+    s = s.upper()
     if len(s) == 7:
-        return s
-    return "#000000"
+        return s + "FF"
+    if len(s) >= 9:
+        return s[:9]
+    return "#000000FF"
+
+
+def update_color_for_sku(sku: str, new_hex: str, file_path: Path | None = None) -> bool:
+    """
+    Update the color hex for a given full SKU in ac_filaments.ini.
+    Returns True on success, False on failure.
+    """
+    try:
+        ini_path = (file_path if file_path is not None
+                    else Path(__file__).parent / "ac_filaments.ini")
+        text = ini_path.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        changed = False
+        new_hex_full = _normalize_hex_full(new_hex)
+
+        out_lines = []
+        for ln in lines:
+            parts = [p.strip() for p in ln.split(";")]
+            if not parts or parts[0] != sku:
+                out_lines.append(ln)
+                continue
+            while len(parts) < 4:
+                parts.append("")
+            parts[3] = new_hex_full
+            out_lines.append(";".join(parts))
+            changed = True
+
+        if not changed:
+            return False
+
+        ini_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+# ------------------------------ UI Widgets --------------------------------
 
 class ColorDot(QtWidgets.QWidget):
     """Simple circular color indicator next to the color combo."""
@@ -69,10 +140,12 @@ class ColorDot(QtWidgets.QWidget):
         p.drawEllipse(r)
         p.end()
 
+
 # ---------- Card presence monitor (no reading) ----------
 class _QtPresenceBridge(QtCore.QObject):
     """Qt bridge object to emit signals from CardObserver callbacks (which run in a background thread)."""
     presenceChanged = QtCore.pyqtSignal(bool)  # True = card present, False = removed
+
 
 class _CardPresenceObserver(CardObserver):
     """pyscard CardObserver that forwards insert/remove events to Qt via a bridge."""
@@ -88,11 +161,17 @@ class _CardPresenceObserver(CardObserver):
         if removed and len(removed) > 0:
             self._bridge.presenceChanged.emit(False)
 
+
+# ------------------------------- MainWindow --------------------------------
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AnycubicNFCTaggerQT5")
         self.resize(620, 400)
+
+        self._filament_ini_path = Path(__file__).parent / "config" / "ac_filaments.ini"
+        self._last_read_full_sku = ""
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -179,20 +258,18 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row.addWidget(self.btn_write)
         btn_row.addStretch()
 
-        # === Log output ===
+        # === Log output + Clear ===
         log_row = QtWidgets.QHBoxLayout()
         self.output = QtWidgets.QPlainTextEdit()
         self.output.setReadOnly(True)
-
         self.btn_clear_log = QtWidgets.QToolButton()
         self.btn_clear_log.setText("Clear Log")
         self.btn_clear_log.setToolTip("Clear the log window")
         self.btn_clear_log.clicked.connect(self.clear_log)
-
         log_row.addWidget(self.output, 1)
         log_row.addWidget(self.btn_clear_log, 0, QtCore.Qt.AlignTop)
-
         layout.addLayout(log_row)
+
         self.statusBar().showMessage("Ready")
 
         # placeholders
@@ -256,7 +333,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.card_present = False
             self.set_icon_state("black")
         else:
-            # If a card is present (from presence monitor), keep green; otherwise red
             self.set_icon_state("green" if self.card_present else "red")
         self._update_actions()
 
@@ -274,10 +350,10 @@ class MainWindow(QtWidgets.QMainWindow):
         reader_ok = self.reader_available
         card_ok = getattr(self, "card_present", False)
 
-        # READ: nur Reader nötig
+        # READ: reader required
         self.btn_read.setEnabled(reader_ok)
 
-        # WRITE: Reader + Karte + gültige Auswahl
+        # WRITE: reader + card + valid selection
         self.btn_write.setEnabled(reader_ok and card_ok and filament_ok and color_ok)
 
     def _set_color_indicator(self, hex_str: str | None):
@@ -291,23 +367,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.color_hex_label.setText(rgb)
 
     def _select_by_sku(self, sku_read: str) -> bool:
-        """Try to preselect filament and color based on SKU (prefers exact match; falls back to base)."""
-        # 1) exakte Full-SKU
-        rec = self.by_sku.get(sku_read)
-        chosen = rec
+        """Preselect filament & color strictly by SKU base (ignore numeric part)."""
+        base = sku_base(sku_read)
+        if not base:
+            self.log(f"[INFO] Keine gültige SKU-Basis für '{sku_read}' ermittelt.")
+            return False
 
-        # 2) Fallback: über SKU-Basis
+        sku_key, chosen = self._find_ini_record_for_base(base)
         if not chosen:
-            base = sku_base(sku_read)
-            if base:
-                # finde *irgendeinen* Eintrag, dessen SKU mit 'BASE-' beginnt
-                for r_sku, r in self.by_sku.items():
-                    if r_sku.startswith(base + "-"):
-                        chosen = r
-                        break
-
-        if not chosen:
-            self.log(f"[INFO] Keine passende Konfiguration für SKU '{sku_read}' (Basis='{sku_base(sku_read)}') gefunden.")
+            self.log(f"[INFO] Keine Konfiguration für SKU-Basis '{base}' gefunden.")
             return False
 
         # Filament auswählen
@@ -316,7 +384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if idx_f <= 0:
             self.log(f"[INFO] Filament '{filament_name}' nicht in Liste gefunden.")
             return False
-        self.combo_filament.setCurrentIndex(idx_f)  # triggert on_filament_changed(), baut Color-Liste
+        self.combo_filament.setCurrentIndex(idx_f)  # triggert on_filament_changed()
 
         # Farbe auswählen (Items: Text=color, Data=(sku, hex))
         color_name = chosen.color
@@ -328,8 +396,115 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"[INFO] Farbe '{color_name}' nicht in Liste für '{filament_name}'.")
             return False
 
+        self.log(f"[DBG] Vorauswahl anhand SKU-Basis '{base}' (Match: {sku_key}).")
         return True
 
+    def _reload_filaments(self, reseat_by_sku: bool = True):
+        """Reload ac_filaments.ini into memory and refresh combos.
+        If reseat_by_sku is True and a last-read full SKU exists,
+        try to auto-select via SKU base; otherwise restore previous selections."""
+        # remember current selections (by text)
+        prev_filament = self.combo_filament.currentText() if self.combo_filament.currentIndex() > 0 else None
+        prev_color = self.combo_color.currentText() if self.combo_color.currentIndex() > 0 else None
+
+        try:
+            self.by_filament, self.by_sku = load_filaments(None)
+        except Exception as e:
+            self.log(f"[ERROR] Reload filaments failed: {e}")
+            return
+
+        # rebuild filament combo
+        self.combo_filament.blockSignals(True)
+        set_placeholder(self.combo_filament, PLACEHOLDER_FILAMENT)
+        names = sorted(self.by_filament.keys(), key=str.casefold)
+        for name in names:
+            self.combo_filament.addItem(name)
+        self.combo_filament.blockSignals(False)
+
+        # default: reset color box
+        set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
+        self.combo_color.setEnabled(False)
+        self._set_color_indicator(None)
+
+        # reseat preference
+        if reseat_by_sku and getattr(self, "_last_read_full_sku", ""):
+            if self._select_by_sku(self._last_read_full_sku):
+                # _select_by_sku setzt die Farbe & rebuildet die Color-Combo
+                self._update_actions()
+                return
+
+        # try to restore previous selection by text
+        if prev_filament:
+            idx_f = self.combo_filament.findText(prev_filament, QtCore.Qt.MatchFixedString)
+            if idx_f > 0:
+                self.combo_filament.setCurrentIndex(idx_f)  # triggers on_filament_changed -> rebuilds color combo
+                if prev_color:
+                    idx_c = self.combo_color.findText(prev_color, QtCore.Qt.MatchFixedString)
+                    if idx_c > 0:
+                        self.combo_color.setCurrentIndex(idx_c)
+                        # refresh color indicator from current item data
+                        data = self.combo_color.currentData()
+                        if data and len(data) >= 2:
+                            self._set_color_indicator(data[1])
+
+        self._update_actions()
+
+    def _append_ini_line(self, sku: str, filament: str, color_name: str, color_hex: str) -> bool:
+        """
+        Append a new line to ac_filaments.ini in the form:
+        SKU;FILAMENT;COLOR;#RRGGBBAA
+        Returns True on success, False on failure.
+        """
+        try:
+            ini_path = self._filament_ini_path
+            # normalize fields
+            sku = (sku or "").strip()
+            filament = (filament or "").strip()
+            color_name = (color_name or "").strip()
+            color_hex = (color_hex or "").strip().upper()
+            if not color_hex.startswith("#"):
+                color_hex = "#" + color_hex
+            if len(color_hex) == 7:
+                color_hex += "FF"
+
+            if not (sku and filament and color_name):
+                self.log("[ERROR] _append_ini_line: missing required fields.")
+                return False
+
+            new_line = f"{sku};{filament};{color_name};{color_hex}"
+
+            with open(ini_path, "a", encoding="utf-8") as f:
+                # Ensure newline if file doesn’t end with one
+                f.write(("\n" if not str(ini_path.read_text()).endswith("\n") else "") + new_line + "\n")
+
+            self.log(f"[DBG] Added new line to INI: {new_line}")
+            return True
+        except Exception as e:
+            self.log(f"[ERROR] _append_ini_line failed: {e}")
+            return False
+
+    def _find_ini_record_for_base(self, base: str):
+        """Find config record by SKU base only (e.g. 'AHHSCG'), ignoring the numeric suffix.
+        Prefers a candidate whose color equals the currently selected color; otherwise returns the first match.
+        Returns (sku_key, rec) or (None, None)."""
+        if not base:
+            return (None, None)
+        candidates = [(k, v) for (k, v) in self.by_sku.items() if k.startswith(base + "-")]
+        if not candidates:
+            self.log(f"[DBG] _find_ini_record_for_base: no candidates for base '{base}'")
+            return (None, None)
+
+        # Prefer the currently selected color if any
+        cur_color = None
+        if self.combo_color.currentIndex() > 0:
+            cur_color = self.combo_color.currentText().strip()
+        if cur_color:
+            for k, v in candidates:
+                if (v.color or "").strip() == cur_color:
+                    return (k, v)
+
+        # Fallback: first candidate
+        return candidates[0]
 
     # === Presence callback (no reading) ===
     @QtCore.pyqtSlot(bool)
@@ -337,11 +512,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """React to card insert/remove events without reading any data."""
         self.card_present = present
         if not self.reader_available:
-            # Reader might be unplugged; keep black
             self.set_icon_state("black")
         else:
             self.set_icon_state("green" if present else "red")
-        self._update_actions()  
+        self._update_actions()
 
     # === Selection handlers ===
     def on_filament_changed(self, filament_name: str):
@@ -385,8 +559,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_actions()
 
     # === Buttons ===
+
     def on_read(self):
-        """On-demand read: try once; set icon accordingly and log ATR/UID."""
+        """On-demand read: connect once; log ATR/UID; parse Anycubic; compare/update INI color."""
         self.refresh_reader_status()
         if not self.reader_available:
             self.log("[ERROR] No NFC reader connected.")
@@ -400,9 +575,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_actions()
             return
 
+        # 1) Nur den Verbindungsaufbau gezielt abfangen
         try:
-            conn.connect()  # fails if no card present
-            # Icon is already green from presence monitor if a card is present.
+            conn.connect()  # wirft NoCardException, wenn keine Karte aufgelegt ist
+        except NoCardException:
+            if self.reader_available:
+                self.set_icon_state("red")
+            self.log("[INFO] No card detected. Place a tag on the reader and try again.")
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            # Unerwarteter Fehler beim Verbinden
+            self.log(f"[ERROR] Connect failed: {e}")
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+            return
+
+        # 2) Ab hier ist die Karte verbunden – alle anderen Fehler NICHT als „No card“ melden
+        try:
+            # ATR/UID
             atr = read_atr(conn) or b""
             uid, sw1, sw2 = read_uid(conn)
             if atr:
@@ -412,23 +608,86 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.log("[INFO] UID not available on this reader/card.")
 
+            # Anycubic-Rohdaten
             info = read_anycubic_fields(conn)
-            self._last_read_full_sku = info.get("sku") or ""
-            nice = interpret_anycubic(info)
 
+            # --- Farbe vom Tag vs. INI vergleichen & ggf. speichern (Basis-Suche) ---
+            self._last_read_full_sku = info.get("sku") or ""
+            tag_hex_full = (info.get("color_hex") or "").upper()
+            base = sku_base(self._last_read_full_sku)
+
+            if base and tag_hex_full:
+                sku_key, ini_rec = self._find_ini_record_for_base(base)
+                if not ini_rec:
+                    msg = (f"No INI entry for SKU base '{base}'.\n"
+                        f"Create new INI entry for full SKU '{self._last_read_full_sku}' with tag color {tag_hex_full}?")
+                    ans = QtWidgets.QMessageBox.question(
+                        self, "Add new INI entry?", msg,
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No
+                    )
+                    if ans == QtWidgets.QMessageBox.Yes:
+                        filament_name = self.combo_filament.currentText().strip() if self.combo_filament.currentIndex() > 0 else ((info.get("material") or "").strip() or "Unknown")
+                        color_name = self.combo_color.currentText().strip() if self.combo_color.currentIndex() > 0 else "Unknown"
+                        if self._append_ini_line(self._last_read_full_sku, filament_name, color_name, tag_hex_full):
+                            self.log(f"[OK] Added INI entry: {self._last_read_full_sku};{filament_name};{color_name};{tag_hex_full}")
+                            self._reload_filaments(reseat_by_sku=True)
+                            self.log(f"[OK] Reload INI: {self._last_read_full_sku};{filament_name};{color_name};{tag_hex_full}")
+
+                        else:
+                            self.log("[ERROR] Could not add new INI entry.")
+                else:
+                    ini_rgb = color_core6(ini_rec.color_hex or "")
+                    tag_rgb = color_core6(tag_hex_full)
+                    if ini_rgb != tag_rgb:
+                        msg = (f"Detected different color for SKU base '{base}' (match: {sku_key}):\n"
+                            f"- Tag: {tag_hex_full}\n"
+                            f"- INI: {ini_rec.color_hex}\n\n"
+                            "Update INI color for this SKU entry?")
+                        ans = QtWidgets.QMessageBox.question(
+                            self, "Update color in INI?", msg,
+                            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                            QtWidgets.QMessageBox.No
+                        )
+                        if ans == QtWidgets.QMessageBox.Yes:
+                            ok = update_color_for_sku(
+                                sku=sku_key,
+                                new_hex=tag_hex_full,
+                                file_path=self._filament_ini_path
+                            )
+                            if ok:
+                                self.log(f"[OK] Updated INI color for {sku_key} -> {tag_hex_full}")
+                                ini_rec.color_hex = tag_hex_full
+                                if self.combo_color.currentIndex() > 0:
+                                    data = self.combo_color.currentData()
+                                    if data and data[0] == sku_key:
+                                        self.combo_color.setItemData(
+                                            self.combo_color.currentIndex(),
+                                            (sku_key, tag_hex_full)
+                                        )
+                                        self._set_color_indicator(tag_hex_full)
+                            else:
+                                self.log("[ERROR] Failed to update ac_filaments.ini — check path/permissions.")
+                    else:
+                        self.log(f"[DBG] color equal (RGB): INI vs Tag for base '{base}' (match: {sku_key})")
+            else:
+                if not base:
+                    self.log("[DBG] skip color compare: no SKU base")
+                if not tag_hex_full:
+                    self.log("[DBG] skip color compare: no color_hex on tag")
+
+            # Anzeige/Auto-Select
+            from anycubic_nfc_qt5.nfc.pcsc import interpret_anycubic
+            nice = interpret_anycubic(info)
             sku = info.get("sku") or ""
             mat = info.get("material") or ""
-
             if sku:
                 self._set_sku(sku)
                 self.log(f"[OK] SKU: {sku}")
-                self._last_read_full_sku = info.get("sku") or ""
-                # Optional: Filament/Color automatisch setzen, falls vorhanden
                 if self._select_by_sku(sku):
-                    self.log("[OK] Vorauswahl per SKU gesetzt (Filament & Color).")
+                    self.log("[OK] Vorauswahl per SKU-Basis gesetzt (Filament & Color).")
             else:
                 self.log("[INFO] Keine SKU erkannt.")
-
             if mat:
                 self.log(f"[OK] Material: {mat}")
 
@@ -441,35 +700,104 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log(f"[OK] Bed-Temp: {fr['bed_temp_min_c']}–{fr['bed_temp_max_c']} °C")
             if "spool_weight_g" in fr and "spool_weight_kg" in fr:
                 self.log(f"[OK] Spulen-Gewicht: {fr['spool_weight_g']} g ({fr['spool_weight_kg']:.3f} kg)")
-            if "unknown_p30_b" in fr:
-                self.log(f"[DBG] p30_b (unbekannt): {fr['unknown_p30_b']}")
 
-
-
-        except Exception:
-            # No card on it → ensure red (unless reader gone)
-            if self.reader_available:
-                self.set_icon_state("red")
-            self.log("[INFO] No card detected. Place a tag on the reader and try again.")
+        except Exception as e:
+            # Irgendein *anderer* Fehler beim Lesen/Parsen → als Error loggen,
+            # NICHT als "No card" (die Karte ist ja verbunden)
+            self.log(f"[ERROR] Read failed: {e}")
         finally:
             try:
                 conn.disconnect()
             except Exception:
                 pass
-            # Reader status will keep being updated by presence monitor / refresh
+
 
     def on_write(self):
-        """Guarded write: require reader and valid selections."""
+        """Write basic Anycubic fields to the tag currently present."""
+        # Reader + UI state checks
         self.refresh_reader_status()
         if not self.reader_available:
             self.log("[ERROR] No NFC reader connected.")
             return
+        if not self.card_present:
+            self.log("[INFO] No card detected. Place a tag on the reader first.")
+            return
+
         filament_ok = self.combo_filament.currentIndex() > 0
         color_ok = self.combo_color.isEnabled() and self.combo_color.currentIndex() > 0
         if not (filament_ok and color_ok):
             self.log("[INFO] Please select filament and color before writing.")
             return
-        self.log("[INFO] WRITE NFC clicked (write logic not implemented yet)")
+
+        # Collect values from UI
+        material = self.combo_filament.currentText().strip()  # e.g., 'PLA High Speed'
+        color_name = self.combo_color.currentText().strip()
+        data = self.combo_color.currentData()  # (sku, color_hex)
+        if not data or len(data) < 2:
+            self.log("[ERROR] Internal error: no SKU/color data attached to color item.")
+            return
+
+        full_sku = data[0] or ""          # full SKU (e.g. 'AHHSCG-101')
+        color_hex_full = (data[1] or "").upper()  # may be '#RRGGBB' or '#RRGGBBAA'
+        if color_hex_full and len(color_hex_full) == 7:
+            color_hex_full += "FF"  # ensure alpha
+
+        manufacturer = "AC"  # default for now
+
+        # Connect to reader
+        conn = connect_first_reader()
+        if conn is None:
+            self.log("[ERROR] No NFC reader available.")
+            self.reader_available = False
+            self.set_icon_state("black")
+            self._update_actions()
+            return
+
+        try:
+            try:
+                conn.connect()
+            except NoCardException:
+                self.set_icon_state("red")
+                self.log("[INFO] No card detected. Place a tag on the reader and try again.")
+                return
+
+            # Perform write
+            self.log(f"[INFO] Writing tag… SKU={full_sku}, Material={material}, Color={color_hex_full}, Manufacturer={manufacturer}")
+            res = write_anycubic_basic(
+                conn,
+                sku=full_sku,
+                manufacturer=manufacturer,
+                material=material,
+                color_hex=color_hex_full,
+            )
+
+            # Summarize results
+            ok_sku    = res.get("p05_sku", False)
+            ok_manu   = res.get("p0A_manu", False)
+            ok_mat    = res.get("p0F_mat", False)
+            ok_color  = res.get("p14_color", False)
+
+            self.log(f"[{'OK' if ok_sku else 'ERR'}] Write p05 (SKU)")
+            self.log(f"[{'OK' if ok_manu else 'ERR'}] Write p10 (Manufacturer)")
+            self.log(f"[{'OK' if ok_mat else 'ERR'}] Write p15 (Material)")
+            self.log(f"[{'OK' if ok_color else 'ERR'}] Write p20 (Color)")
+
+            if all((ok_sku, ok_manu, ok_mat, ok_color)):
+                self.log("[OK] Basic data written successfully.")
+            else:
+                self.log("[WARN] Some fields could not be written. The tag may be locked or protected.")
+
+            # Optional: sofort verifizieren (READ erneut ausführen)
+            # -> du kannst hier `self.on_read()` rufen, wenn du die Werte gleich prüfen willst
+            # self.on_read()
+
+        except Exception as e:
+            self.log(f"[ERROR] Write failed: {e}")
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """Detach presence observer on close."""
@@ -481,6 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
         finally:
             super().closeEvent(event)
+
 
 def run_app():
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)

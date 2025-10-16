@@ -4,8 +4,9 @@ import csv
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from importlib import resources
+from pathlib import Path
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)    # False=change properties is possible, True=this class is readonly
 class FilamentRecord:
     sku: str
     filament: str
@@ -59,3 +60,51 @@ def load_filaments(path: Optional[str] = None) -> Tuple[Dict[str, List[FilamentR
             by_filament.setdefault(filament, []).append(rec)
 
     return by_filament, by_sku
+
+
+def _normalize_hex_full(h: str) -> str:
+    """Return '#RRGGBBAA' uppercase if possible; accept '#RRGGBB' -> '#RRGGBBFF'."""
+    s = (h or "").strip()
+    if not s.startswith("#"):
+        return "#000000FF"
+    s = s.upper()
+    if len(s) == 7:
+        return s + "FF"
+    if len(s) >= 9:
+        return s[:9]
+    return "#000000FF"
+
+def update_color_for_sku(sku: str, new_hex: str, file_path: Path | None = None) -> bool:
+    """
+    Update the color hex for a given full SKU in ac_filaments.ini.
+    Returns True on success, False on failure.
+    """
+    try:
+        ini_path = (file_path if file_path is not None
+                    else Path(__file__).parent / "ac_filaments.ini")
+        text = ini_path.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        changed = False
+        new_hex_full = _normalize_hex_full(new_hex)
+
+        out_lines = []
+        for ln in lines:
+            # tolerate spaces/tabs; compare by first field before ';'
+            parts = [p.strip() for p in ln.split(";")]
+            if not parts or parts[0] != sku:
+                out_lines.append(ln)
+                continue
+            # ensure at least 4 fields: SKU;FILAMENT;COLOR;COLOR_HEX
+            while len(parts) < 4:
+                parts.append("")
+            parts[3] = new_hex_full
+            out_lines.append(";".join(parts))
+            changed = True
+
+        if not changed:
+            return False  # sku not found
+
+        ini_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False

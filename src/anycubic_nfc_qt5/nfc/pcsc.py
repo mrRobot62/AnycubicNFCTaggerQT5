@@ -348,3 +348,247 @@ def interpret_anycubic(info: dict) -> dict:
 
     out["friendly"] = friendly
     return out
+
+# --- Low-level helpers for Anycubic layout ---
+def _read_u16_at(conn, page: int, byte_offset: int) -> int | None:
+    """Read little-endian uint16 at page+offset (offset 0 or 2)."""
+    b = read_page_ultralight(conn, page)
+    if not b or byte_offset not in (0, 2):
+        return None
+    lo = b[byte_offset]
+    hi = b[byte_offset + 1]
+    return lo | (hi << 8)
+
+def _read_string_page(conn, page: int, max_len: int = 32) -> str:
+    """Read zero-terminated ASCII starting at given page (4 bytes/page)."""
+    buf = bytearray()
+    p = page
+    while len(buf) < max_len:
+        q = read_page_ultralight(conn, p)
+        if not q:
+            break
+        buf.extend(q)
+        if 0x00 in q:
+            break
+        p += 1
+    return bytes(buf).split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+
+def _read_color_rgba_hex(conn, page: int) -> str | None:
+    """Read 4 bytes at page and return '#RRGGBBAA'.
+    Many tags store bytes in reverse order; using reversed bytes is robust."""
+    b = read_page_ultralight(conn, page)
+    if not b or len(b) != 4:
+        return None
+    # Reverse to get RGBA: [R,G,B,A] = reversed([b0,b1,b2,b3])
+    r, g, b_, a = reversed(b)
+    return f"#{r:02X}{g:02X}{b_:02X}{a:02X}"
+
+def read_anycubic_fields(conn):
+    """
+    Parse Anycubic raw layout (Type 2 / NTAG):
+      - SKU: pages 5.. (zero-terminated ASCII)
+      - manufacturer: page 0x0A (10), ASCII
+      - material: page 0x0F (15), ASCII (z.B. 'PLA+', 'ASA')
+      - color: page 0x14 (20), 4 bytes -> '#RRGGBBAA'
+      - ranges A,B,C: pages 0x17..0x1C (23..28), u16 pairs (little-endian)
+      - bed: page 0x1D (29), u16@0=min, u16@2=max
+      - diameter/length: page 0x1E (30), dia=(u16@0)/100, length=u16@2
+      - weight: page 0x1F (31), u16@0 (grams)
+    Plus: ATR/UID (wenn verfügbar) und ein 'params' Roh-Block fürs Debugging.
+    """
+    out = {}
+
+    # ATR + UID
+    try:
+        out["atr"] = read_atr(conn) or b""
+    except Exception:
+        out["atr"] = b""
+    uid, sw1, sw2 = read_uid(conn)
+    if uid is not None:
+        out["uid"] = uid
+
+    # ASCII strings
+    out["sku"] = _read_ascii_z(conn, start_page=5, max_len=32)  # bereits vorhanden
+    out["manufacturer"] = _read_string_page(conn, 0x0A, 16) or ""
+    out["material"] = _read_string_page(conn, 0x0F, 16) or ""
+
+    # Color
+    out["color_hex"] = _read_color_rgba_hex(conn, 0x14)  # '#RRGGBBAA' or None
+
+    # Ranges A/B/C (speed/nozzle)
+    def _range_tuple(p_speed: int, p_noz: int) -> dict:
+        return {
+            "speed_min": _read_u16_at(conn, p_speed, 0),
+            "speed_max": _read_u16_at(conn, p_speed, 2),
+            "nozzle_min": _read_u16_at(conn, p_noz, 0),
+            "nozzle_max": _read_u16_at(conn, p_noz, 2),
+        }
+
+    out["range_a"] = _range_tuple(0x17, 0x18)
+    out["range_b"] = _range_tuple(0x19, 0x1A)
+    out["range_c"] = _range_tuple(0x1B, 0x1C)
+
+    # Bed temps
+    out["bed_min"] = _read_u16_at(conn, 0x1D, 0)
+    out["bed_max"] = _read_u16_at(conn, 0x1D, 2)
+
+    # Diameter / Length / Weight
+    dia_raw = _read_u16_at(conn, 0x1E, 0)
+    out["diameter_mm"] = (dia_raw / 100.0) if isinstance(dia_raw, int) else None
+    out["length_m"] = _read_u16_at(conn, 0x1E, 2)  # meters (typ. ~330)
+    out["weight_g"] = _read_u16_at(conn, 0x1F, 0)  # grams (typ. 1000)
+
+    # Keep existing 'params' for backward-compat / debugging:
+    params = {}
+    for pg in range(23, 32):
+        b = read_page_ultralight(conn, pg)
+        if b:
+            lo = b[0] | (b[1] << 8)
+            hi = b[2] | (b[3] << 8)
+            params[f"p{pg}_a"] = lo
+            params[f"p{pg}_b"] = hi
+    out["params"] = params
+
+    # Raw bytes we previously surfaced as dbg
+    out["p20_raw"] = read_page_ultralight(conn, 20)
+    out["p40_raw"] = read_page_ultralight(conn, 40)
+    out["p41_raw"] = read_page_ultralight(conn, 41)
+    out["p42_raw"] = read_page_ultralight(conn, 42)
+
+    return out
+
+def interpret_anycubic(info: dict) -> dict:
+    """Human-friendly mapping with the new fields."""
+    out = dict(info)
+    friendly = {}
+
+    # Direct fields
+    if info.get("diameter_mm") is not None:
+        friendly["filament_diameter_mm"] = info["diameter_mm"]
+    if info.get("weight_g") is not None:
+        friendly["spool_weight_g"] = info["weight_g"]
+        friendly["spool_weight_kg"] = info["weight_g"] / 1000.0
+    if info.get("bed_min") is not None and info.get("bed_max") is not None:
+        friendly["bed_temp_min_c"] = info["bed_min"]
+        friendly["bed_temp_max_c"] = info["bed_max"]
+
+    # Prefer „range_a“ als Hauptbereich (falls gesetzt), sonst b/c als Fallback
+    def pick_range(*ranges):
+        for r in ranges:
+            if r and r.get("nozzle_min") is not None and r.get("nozzle_max") is not None:
+                return r
+        return None
+
+    rpick = pick_range(info.get("range_a"), info.get("range_b"), info.get("range_c"))
+    if rpick:
+        friendly["nozzle_temp_min_c"] = rpick["nozzle_min"]
+        friendly["nozzle_temp_max_c"] = rpick["nozzle_max"]
+        if rpick.get("speed_min") is not None and rpick.get("speed_max") is not None:
+            friendly["speed_min"] = rpick["speed_min"]
+            friendly["speed_max"] = rpick["speed_max"]
+
+    # Keep also the full ranges block for UI/debug
+    friendly["ranges"] = {
+        "A": info.get("range_a"),
+        "B": info.get("range_b"),
+        "C": info.get("range_c"),
+    }
+
+    # Color passt sauber aus info['color_hex']
+    if info.get("color_hex"):
+        friendly["color_hex"] = info["color_hex"]
+
+    out["friendly"] = friendly
+    return out
+
+
+# --- Ultralight / NTAG write helpers (PC/SC UPDATE BINARY) ---
+
+def write_page_ultralight(conn, page: int, data4: bytes) -> tuple[bool, int, int]:
+    """Write exactly 4 bytes to one NTAG/Ultralight page using PC/SC UPDATE BINARY.
+    Returns (ok, sw1, sw2)."""
+    if not isinstance(data4, (bytes, bytearray)) or len(data4) != 4:
+        raise ValueError("write_page_ultralight expects exactly 4 bytes")
+    # APDU: FF D6 00 <page> 04 <4 bytes>
+    apdu = [0xFF, 0xD6, 0x00, page & 0xFF, 0x04] + list(data4)
+    data, sw1, sw2 = conn.transmit(apdu)
+    return (sw1 == 0x90 and sw2 == 0x00), sw1, sw2
+
+
+def write_ascii_z(conn, start_page: int, text: str, max_len: int = 32) -> bool:
+    """Write a zero-terminated ASCII string across pages.
+    Writes (min(len(text), max_len)) + 1 (terminator) bytes."""
+    raw = (text or "").encode("ascii", errors="ignore")[:max_len] + b"\x00"
+    # Write in 4-byte chunks
+    ok_all = True
+    for i in range(0, len(raw), 4):
+        chunk = raw[i:i+4]
+        if len(chunk) < 4:
+            chunk = chunk + b"\x00"*(4-len(chunk))
+        page = start_page + (i // 4)
+        ok, sw1, sw2 = write_page_ultralight(conn, page, chunk)
+        if not ok:
+            ok_all = False
+            break
+    return ok_all
+
+
+def write_color_rgba_hex(conn, page: int, color_hex: str) -> bool:
+    """Write color at one page as 4 bytes in 'tag order' (ABGR as seen on dumps),
+    taking '#RRGGBB' or '#RRGGBBAA' and converting to bytes accordingly.
+    We store in the same order we observed while reading (reverse when needed)."""
+    s = (color_hex or "").strip().lstrip("#")
+    if len(s) not in (6, 8):
+        return False
+    if len(s) == 6:
+        s = s + "FF"  # default alpha
+    # We read back as reversed bytes -> to write the same representation, reverse here
+    # Read-side used: r,g,b,a = reversed(b)
+    r = int(s[0:2], 16)
+    g = int(s[2:4], 16)
+    b = int(s[4:6], 16)
+    a = int(s[6:8], 16)
+    # Tag stores as [A, B, G, R] in the dumps we saw
+    data = bytes([a, b, g, r])
+    ok, sw1, sw2 = write_page_ultralight(conn, page, data)
+    return ok
+
+
+# --- High-level write spec for future extension ---
+
+def write_anycubic_basic(conn, *, sku: str, manufacturer: str, material: str, color_hex: str) -> dict:
+    """Write the basic Anycubic fields:
+       - p05.. : SKU (zero-terminated ASCII)
+       - p0A   : manufacturer (ASCII, 2 chars recommended)
+       - p0F   : material (ASCII)
+       - p14   : color as 4 bytes (ABGR as per dumps), from '#RRGGBB' or '#RRGGBBAA'
+       Returns a dict with per-field success flags."""
+    results = {
+        "p05_sku": False,
+        "p0A_manu": False,
+        "p0F_mat": False,
+        "p14_color": False,
+    }
+    try:
+        # SKU at page 5
+        results["p05_sku"] = write_ascii_z(conn, 0x05, sku, max_len=32)
+        # Manufacturer at page 0x0A (10)
+        # keep it short (2–4 bytes). Excess is truncated by write_ascii_z.
+        results["p0A_manu"] = write_ascii_z(conn, 0x0A, manufacturer, max_len=8)
+        # Material at page 0x0F (15)
+        results["p0F_mat"]  = write_ascii_z(conn, 0x0F, material, max_len=16)
+        # Color at page 0x14 (20)
+        results["p14_color"] = write_color_rgba_hex(conn, 0x14, color_hex)
+    except Exception:
+        # Leave flags as-is; caller can inspect
+        pass
+    return results
+
+def write_anycubic_params(conn, *, 
+                          range_a=None, range_b=None, range_c=None,
+                          bed_min=None, bed_max=None,
+                          diameter_mm=None, length_m=None, weight_g=None) -> dict:
+    """Write optional parameters; each range = dict with speed_min/speed_max/nozzle_min/nozzle_max."""
+    results = {}
+    # TODO: fill with write_bytes helpers similar to read_u16_at (use write_page_ultralight + little-endian packing)
+    return results
