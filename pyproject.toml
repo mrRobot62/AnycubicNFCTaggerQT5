@@ -17,10 +17,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mrRobot62/AnycubicNFCTaggerQT5#"
+Homepage = "https://github.com/mrRobot62/AnycubicNFCTaggerQT5"
 Source = "https://github.com/mrRobot62/AnycubicNFCTaggerQT5.git"
 
-# Optionaler Starter zusätzlich zu `python AnycubicNFCTaggerQT5.py`
 [project.gui-scripts]
 AnycubicNFCTaggerQT5 = "anycubic_nfc_qt5.app:run_app"
 
@@ -35,30 +34,5 @@ anycubic_nfc_qt5 = [
   "config/ac_filaments.ini",
   "ui/resources/nfc_black.png",
   "ui/resources/nfc_green.png",
-  "ui/resources/nfc_red.png"
-]  
-
-
-# Falls du Paketdaten ohne MANIFEST.in einbinden willst:
-# [tool.setuptools.package-data]
-# "anycubic_nfc_qt5" = ["ui/resources/*"]
-
-# ---------- cx_Freeze: EXE/.app Build-Konfiguration ----------
-[tool.cxfreeze.build_exe]
-# Optionen für das Einfrieren
-excludes = ["tkinter"]
-includes = ["PyQt5", "smartcard"]
-packages = ["os", "sys", "anycubic_nfc_qt5"]
-include_files = []         # z.B. ["src/anycubic_nfc_qt5/ui/resources/app.ico"]
-optimize = 1
-silent_level = 0
-
-# Definiere die zu bauenden Executables
-[[tool.cxfreeze.executables]]
-script = "AnycubicNFCTaggerQT5.py"
-# Unter Windows GUI-Modus, sonst leer/Console
-base = "Win32GUI"
-# Zielname (Windows bekommt .exe automatisch, falls leer, hier explizit gesetzt)
-target_name = "AnycubicNFCTaggerQT5.exe"
-# Icon-Datei, falls vorhanden (Windows: .ico, macOS: .icns)
-# icon = "src/anycubic_nfc_qt5/ui/resources/app.ico"
+  "ui/resources/nfc_red.png",
+]

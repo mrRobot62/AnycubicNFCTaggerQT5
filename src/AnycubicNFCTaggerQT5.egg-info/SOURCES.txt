@@ -1,6 +1,7 @@
 LICENSE
 MANIFEST.in
 README.md
+freeze_setup.py
 pyproject.toml
 src/AnycubicNFCTaggerQT5.egg-info/PKG-INFO
 src/AnycubicNFCTaggerQT5.egg-info/SOURCES.txt
