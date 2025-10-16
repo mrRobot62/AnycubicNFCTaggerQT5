@@ -167,8 +167,8 @@ class _CardPresenceObserver(CardObserver):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AnycubicNFCTaggerQT5")
-        self.resize(620, 400)
+        self.setWindowTitle("AnycubicNFCTaggerQT5 - V0.2")
+        self.resize(800, 600)
 
         self._filament_ini_path = Path(__file__).parent / "config" / "ac_filaments.ini"
         self._last_read_full_sku = ""
@@ -253,6 +253,12 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(btn_row)
         self.btn_read = QtWidgets.QPushButton("READ NFC")
         self.btn_write = QtWidgets.QPushButton("WRITE NFC")
+
+        # small reset tool button
+        self.btn_reset = QtWidgets.QToolButton()
+        self.btn_reset.setText("Reset combos")
+        self.btn_reset.setToolTip("Reset filament & color selection")
+
         btn_row.addStretch()
         btn_row.addWidget(self.btn_read)
         btn_row.addWidget(self.btn_write)
@@ -266,8 +272,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear_log.setText("Clear Log")
         self.btn_clear_log.setToolTip("Clear the log window")
         self.btn_clear_log.clicked.connect(self.clear_log)
+
+        # Right-side vertical column for action buttons
+        right_col = QtWidgets.QVBoxLayout()
+        right_col.addWidget(self.btn_clear_log, 0, QtCore.Qt.AlignTop)
+        right_col.addWidget(self.btn_reset, 0, QtCore.Qt.AlignTop)
+        right_col.addStretch()
+
+        # Add the log output and the right-side column
         log_row.addWidget(self.output, 1)
-        log_row.addWidget(self.btn_clear_log, 0, QtCore.Qt.AlignTop)
+        log_row.addLayout(right_col, 0)
+
         layout.addLayout(log_row)
 
         self.statusBar().showMessage("Ready")
@@ -288,12 +303,14 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.log(f"[Error] Failed to load filaments: {e}")
 
-        # Signals
+        # Signals (connect event with callback function)
         self.combo_filament.currentTextChanged.connect(self.on_filament_changed)
         self.combo_color.currentTextChanged.connect(self.on_color_changed)
         self.btn_read.clicked.connect(self.on_read)
         self.btn_write.clicked.connect(self.on_write)
         self.btn_refresh.clicked.connect(self.refresh_reader_status)
+        self.btn_reset.clicked.connect(self.on_reset_selection) 
+
 
         # Initial reader status + auto-refresh (no APDUs)
         self.refresh_reader_status()
@@ -711,6 +728,35 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def on_reset_selection(self):
+        """Reset both combo boxes to their placeholders, clear SKU and color indicator."""
+        # Block signals to avoid triggering change handlers during reset
+        self.combo_filament.blockSignals(True)
+        self.combo_color.blockSignals(True)
+
+        set_placeholder(self.combo_filament, PLACEHOLDER_FILAMENT)
+        set_placeholder(self.combo_color, PLACEHOLDER_COLOR)
+        self.combo_color.setEnabled(False)
+
+        # Re-populate filament names so auto-select on READ works after reset
+        try:
+            names = sorted(self.by_filament.keys(), key=str.casefold)
+            for name in names:
+                self.combo_filament.addItem(name)
+        except Exception:
+            pass
+
+        self.combo_filament.blockSignals(False)
+        self.combo_color.blockSignals(False)
+
+        # Clear helpers/labels
+        self._set_color_indicator(None)
+        self._set_sku(None)
+        self._last_read_full_sku = ""
+
+        # Update UI state and inform user
+        self._update_actions()
+        self.log("[INFO] Selection reset.")
 
     def on_write(self):
         """Write basic Anycubic fields to the tag currently present."""
