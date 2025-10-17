@@ -13,3 +13,6 @@ This folder contains the documentation generated from the V03 source tarball.
 > - **USER_GUIDE_DE.md** (Nutzer Handbuch)
 > - **PACKAGING_SIGNING.md** (macOS codesign+notarization, Windows signing)
 > - **CHANGELOG.md** (release notes; current version detected: 0.3.0)
+
+# Sneak Preview
+<img width="1257" height="719" alt="image" src="https://github.com/user-attachments/assets/5b69f6dd-2f90-4637-83a4-c2a31feb1cef" />
