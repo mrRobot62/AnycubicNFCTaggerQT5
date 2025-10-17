@@ -1,6 +1,12 @@
 # AnycubicNFCTaggerQT5
 NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubic #filament #nfc
 
+# Releases
+## V0.3.0
+Release Candidate. See release downloads
+## V0.2.0
+first stable release. See release downloads
+
 
 ## No NFC-Reader found 
 - initial screen, reader not connected via USB
