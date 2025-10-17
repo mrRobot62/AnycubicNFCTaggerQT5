@@ -1,4 +1,4 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: AnycubicNFCTaggerQT5
 Version: 0.3.0
 Summary: PyQt5 GUI for Anycubic NFC filament tagging
@@ -11,7 +11,6 @@ Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: PyQt5<6,>=5.15
 Requires-Dist: pyscard>=2.0
-Dynamic: license-file
 
 # AnycubicNFCTaggerQT5
 NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubic #filament #nfc

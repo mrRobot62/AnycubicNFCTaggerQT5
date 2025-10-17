@@ -16,8 +16,18 @@ build_exe_options = dict(
     optimize=1,
 )
 
-# Auf macOS brauchst du kein spezielles Base für GUI; None ist ok.
-# Wenn du magst, kannst du base="gui" setzen – cx_Freeze akzeptiert es.
+# inside setup(..., options={"bdist_mac": {...}})
+bdist_mac_options = {
+    "bundle_name": "AnycubicNFCTaggerQT5",
+    "iconfile": "packaging/macos/app.icns",  # adjust if needed
+    "custom_info_plist": {
+        "CFBundleIdentifier": "com.yourorg.anycubicnfctaggerqt5",
+        "CFBundleDisplayName": "AnycubicNFCTaggerQT5",
+        "LSMinimumSystemVersion": "12.0",
+        "NSHighResolutionCapable": True,
+    },
+}
+
 base = "gui" if sys.platform == "darwin" else None
 
 executables = [
