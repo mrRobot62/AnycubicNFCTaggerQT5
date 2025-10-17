@@ -1,10 +1,12 @@
 # src/anycubic_nfc_qt5/ui/main_window.py
+from __future__ import annotations
+
 from pathlib import Path
 from PyQt5 import QtWidgets, QtGui, QtCore
 from importlib import resources
 from smartcard.Exceptions import NoCardException
-import sys, traceback
-
+import sys
+import traceback
 
 from ..constants import PLACEHOLDER_FILAMENT, PLACEHOLDER_COLOR
 from ..utils.placeholders import set_placeholder
@@ -24,26 +26,20 @@ from ..nfc.pcsc import (
     write_raw_pages,
     clear_user_area,
 )
-from .prefill import (
-    map_ascii_to_pages,
-    color_hex_to_rgba4,
-)
-from .nfc_fields import (
-    P,
-    map_ascii_span,
-    map_color_rgba,
-    map_u16,
-    to_rgba_bytes,
-    PAGE_NAME_MAP,   
-    U16_PAGES,      
-)
 
+# unified field mapping helpers (multi-page aware)
+from .nfc_fields import (
+    P,                 # logical field spans
+    map_ascii_span,    # map long ASCII strings to PageSpan
+    map_color_rgba,    # map hex color to RGBA page
+    map_u16,           # map u16 numbers to a page
+)
 
 from .widgets.color_dot import ColorDot
 from .docks.page_editor_dock import PageEditorDock
 
 
-# ---------- helpers (local) ----------
+# ---------- local helpers ----------
 def _ascii4(s: str) -> bytes:
     """Return first 4 ASCII bytes (padded with 00)."""
     b = (s or "").encode("ascii", errors="ignore")[:4]
@@ -95,8 +91,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pm.loadFromData(data)
                 self.icons[key] = pm
             except Exception as e:
-                self.log(f"[WARN] Could not load icon {fname}: {e}")
-                self.log_exception()
+                print(f"[WARN] Could not load icon {fname}: {e}", file=sys.stderr)
 
         self._icon_state = "black"
         self.reader_available = False
@@ -223,6 +218,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def log(self, msg: str):
         self.output.appendPlainText(msg)
 
+    def log_exception(self, prefix: str = "[ERROR]"):
+        """Append full traceback of the active exception to the log window and stderr."""
+        exc = traceback.format_exc()
+        self.log(f"{prefix}\n{exc}")
+        print(exc, file=sys.stderr)
+
     def set_icon_state(self, key: str):
         pix = self.icons.get(key)
         if pix:
@@ -310,7 +311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_sku(sku)
         self.log(f"Selected color: {color_name} [{normalize_hex(hex_str)}], SKU={sku}")
 
-        # ---- Prefill PageEditorDock with current selection (multi-page aware) ----
+        # Prefill PageEditorDock with current selection (multi-page aware; non-destructive)
         material = self.combo_filament.currentText().strip()
         manufacturer = "AC"
         color_full = (hex_str or "").upper()
@@ -318,38 +319,17 @@ class MainWindow(QtWidgets.QMainWindow):
             color_full += "FF"
 
         staged = {}
-        # SKU & MATERIAL über Spannen verteilen (nur Preview – wir füllen hier bewusst nur die ERSTE Page kurz an,
-        # wenn du komplette Verteilung willst, nimm die map_ascii_span-Zeilen und entferne die _ascii4 Kurzvorschau.)
-        staged.update(map_ascii_span(P.SKU, sku))           # verteilt über z. B. 0x05..0x09
+        staged.update(map_ascii_span(P.SKU, sku))
         staged.update(map_ascii_span(P.MANUFACTURER, manufacturer, max_pages=1))
-        staged.update(map_ascii_span(P.MATERIAL, material)) # verteilt über 0x15..0x1C
-        staged.update(map_color_rgba(P.COLOR, color_full))           # 0x20
+        staged.update(map_ascii_span(P.MATERIAL, material))
+        staged.update(map_color_rgba(P.COLOR, color_full))
 
         try:
             self.page_dock.stage_pages(staged, mark_changed=False)
         except Exception:
-            pass
+            self.log_exception()
 
         self._update_actions()
-
-        staged: dict[int, bytes] = {}
-        # SKU: start at 0x05, allow up to 5 pages (20 bytes) – adjust if you confirm a larger span
-        staged.update(map_ascii_to_pages(0x05, sku, max_pages=5))
-        # Vendor: 1 page at 0x10
-        staged.update(map_ascii_to_pages(0x10, manufacturer, max_pages=1))
-        # Material: start at 0x15, allow up to 8 pages (32 bytes)
-        staged.update(map_ascii_to_pages(0x15, material, max_pages=8))
-        # Color (RGBA) at 0x20
-        staged[0x20] = color_hex_to_rgba4(color_full)
-
-        try:
-            # Non-destructive fill (does not mark rows "edited" and does not overwrite user edits)
-            self.page_dock.stage_pages(staged, mark_changed=False)
-        except Exception:
-            pass
-
-        self._update_actions()
-
 
     # ---------- NFC: READ ----------
     def on_read(self):
@@ -442,57 +422,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not tag_hex_full:
                     self.log("[DBG] skip color compare: no color_hex on tag]")
 
-            # Show basic info
-            nice = interpret_anycubic(info)
-            # ASCII-Spannen vom Tag (sofern vorhanden)
-            sku_rd   = info.get("sku") or ""
-            manu_rd  = info.get("manufacturer") or "AC"
-            mat_rd   = info.get("material") or ""
-            color_rd = (info.get("color_hex") or "").upper()
-            if color_rd and len(color_rd) == 7:
-                color_rd += "FF"
-
-            staged = {}
-            staged.update(map_ascii_span(P.SKU, sku_rd))
-            staged.update(map_ascii_span(P.MANUFACTURER, manu_rd, max_pages=1))
-
-            staged.update(map_ascii_span(P.MATERIAL, mat_rd))
-            staged.update(map_color_rgba(P.COLOR, color_rd or "#000000FF"))
-
-            # Numerische Felder (u16, LE)
-            if "nozzle_temp_min_c" in info:
-                staged.update(map_u16(P.NOZZLE_MIN, info["nozzle_temp_min_c"]))
-            if "nozzle_temp_max_c" in info:
-                staged.update(map_u16(P.NOZZLE_MAX, info["nozzle_temp_max_c"]))
-            if "bed_temp_min_c" in info:
-                staged.update(map_u16(P.BED_MIN, info["bed_temp_min_c"]))
-            if "bed_temp_max_c" in info:
-                staged.update(map_u16(P.BED_MAX, info["bed_temp_max_c"]))
-            if "filament_diameter_mm" in info:
-                staged.update(map_u16(P.DIAMETER_MM_X100, int(float(info["filament_diameter_mm"]) * 100)))
-            if "spool_weight_g" in info:
-                staged.update(map_u16(P.WEIGHT_G, info["spool_weight_g"]))
-
-            self.page_dock.stage_pages(staged, mark_changed=False)
-
-
-            # ---- Prefill PageEditorDock from tag info (multi-page aware) ----
+            # ---- Anzeige / Auto-Select / Prefill ----
             try:
-                sku_rd   = info.get("sku") or ""
-                manu_rd  = info.get("manufacturer") or "AC"
-                mat_rd   = info.get("material") or ""
-                color_rd = (info.get("color_hex") or "").upper()
+                self.log("[DBG] interpret_anycubic…")
+                nice = interpret_anycubic(info) or {}
+                sku = (info.get("sku") or "").strip()
+                mat = (info.get("material") or "").strip()
+                raw_color = (info.get("color_hex") or "").strip()
+
+                if sku:
+                    self._set_sku(sku)
+                    self.log(f"[OK] SKU: {sku}")
+                    try:
+                        if self._select_by_sku(sku):
+                            self.log("[OK] Vorauswahl per SKU-Basis gesetzt (Filament & Color).")
+                        else:
+                            self.log("[DBG] _select_by_sku() returned False.")
+                    except Exception as e:
+                        self.log(f"[ERROR] _select_by_sku failed: {e}")
+                        self.log_exception()
+                else:
+                    self.log("[INFO] Keine SKU erkannt.]")
+
+                if mat:
+                    self.log(f"[OK] Material: {mat}]")
+
+                # Color: log + indicator + stage into editor (RGBA), non-destructive
+                if raw_color:
+                    self.log(f"[OK] Color (tag): {raw_color}]")
+                    self._set_color_indicator(raw_color)
+                    rgba = raw_color.upper()
+                    if len(rgba) == 7:  # "#RRGGBB" -> add alpha
+                        rgba += "FF"
+                else:
+                    rgba = ""
 
                 staged = {}
-                # ASCII-Spans
-                staged.update(map_ascii_span(P.SKU, sku_rd))
-                staged.update(map_ascii_span(P.MANUFACTURER, manu_rd, max_pages=1))
-                staged.update(map_ascii_span(P.MATERIAL, mat_rd))
-                # Farbe
-                if color_rd:
-                    staged.update(map_color_rgba(P.COLOR, color_rd))
+                staged.update(map_ascii_span(P.SKU, sku))
+                staged.update(map_ascii_span(P.MANUFACTURER, info.get("manufacturer") or "AC", max_pages=1))
+                staged.update(map_ascii_span(P.MATERIAL, mat))
+                if rgba:
+                    staged.update(map_color_rgba(P.COLOR, rgba))
 
-                # U16-Felder (alle als 16-bit Little/Big je nach Definition in nfc_fields)
                 if "nozzle_temp_min_c" in info:
                     staged.update(map_u16(P.NOZZLE_MIN, int(info["nozzle_temp_min_c"])))
                 if "nozzle_temp_max_c" in info:
@@ -504,19 +475,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 if "spool_weight_g" in info:
                     staged.update(map_u16(P.WEIGHT_G, int(info["spool_weight_g"])))
                 if "filament_diameter_mm" in info:
-                    # z.B. 1.75 mm → als Centi-mm (175) auf 0x11 o.ä., je nach Definition in nfc_fields.P.DIAMETER_CENTI
                     try:
                         staged.update(map_u16(P.DIAMETER_CENTI, int(round(float(info["filament_diameter_mm"]) * 100))))
                     except Exception:
                         pass
 
                 self.page_dock.stage_pages(staged, mark_changed=False)
+
             except Exception as e:
-                self.log(f"[WARN] Prefill dock failed: {e}")
+                self.log(f"[WARN] Prefill dock failed: {e}]")
                 self.log_exception()
 
         except Exception as e:
-            self.log(f"[ERROR] Read failed: {e}")
+            self.log(f"[ERROR] Read failed: {e}]")
             self.log_exception()
         finally:
             try:
@@ -609,11 +580,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if not pages:
             self.log("[SIM] Nothing to simulate.")
             return
-        self.log("[SIM] ---- BEGIN ----")
+
+        # helper: ASCII-4 aus 4 Bytes (nicht druckbare -> '.')
+        def _ascii4(b4: bytes) -> str:
+            b4 = (b4 or b"")[:4]
+            b4 = b4 + b"\x00" * (4 - len(b4))
+            return "".join(chr(x) if 32 <= x < 127 else "." for x in b4)
+
+        self.log("---- START (HEX) --------------")
         for p in sorted(pages.keys()):
-            data = pages[p]
-            self.log(f"0x{p:02X}: " + " ".join(f"0x{b:02X}" for b in data))
-        self.log("[SIM] ---- END ----")
+            b4 = (pages[p] or b"")[:4]
+            b4 = b4 + b"\x00" * (4 - len(b4))
+            hex_line = " ".join(f"{x:02X}" for x in b4)
+            asc_line = _ascii4(b4)
+            # genau das gewünschte Format (ohne Page-ID)
+            self.log(f"p{p:02d}: | {hex_line} | {asc_line}")
+        self.log("---- END ----------------------")
 
     @QtCore.pyqtSlot(dict)
     def _on_editor_write(self, payload: dict):
@@ -815,13 +797,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._update_actions()
         self.log("[INFO] Selection reset.")
-
-    def log_exception(self, prefix: str = "[ERROR]"):
-        """Append full traceback of the active exception to the log window."""
-        exc = traceback.format_exc()
-        self.log(f"{prefix}\n{exc}")
-        # zusätzlich auf STDERR ausgeben – praktisch beim Start aus Terminal
-        print(exc, file=sys.stderr)
 
     # ---------- close ----------
     def closeEvent(self, event: QtGui.QCloseEvent):

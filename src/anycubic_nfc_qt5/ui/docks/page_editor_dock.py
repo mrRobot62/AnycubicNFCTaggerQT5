@@ -231,6 +231,12 @@ class PageEditorDock(QtWidgets.QDockWidget):
         self.btnClear = QtWidgets.QPushButton("CLEAR")
         self.btnDelete = QtWidgets.QPushButton("DELETE (User Area)")
         self.btnDelete.setStyleSheet("color:#a00;")
+
+        self.btnWrite.setToolTip("Write only marked pages to NFC-Tag")
+        self.btnSim.setToolTip("Log binary pages in log window")
+        self.btnClear.setToolTip("Clear all user area pages to 0x00")
+        self.btnDelete.setToolTip("Dangerours - delete user area on NFC-Tag and write 0x00")
+
         h.addWidget(self.btnWrite)
         h.addStretch()
         h.addWidget(self.btnSim)
@@ -243,14 +249,23 @@ class PageEditorDock(QtWidgets.QDockWidget):
         hh = QtWidgets.QGridLayout(header)
         hh.setContentsMargins(10, 0, 10, 0)
         hh.setColumnStretch(5, 1)
-        hh.addWidget(QtWidgets.QLabel("Apply"), 0, 0)
-        hh.addWidget(QtWidgets.QLabel("Page"), 0, 1)
-        hh.addWidget(QtWidgets.QLabel("Name"), 0, 2)
-        hh.addWidget(QtWidgets.QLabel("B0"), 0, 3)
-        hh.addWidget(QtWidgets.QLabel("B1"), 0, 4)
-        hh.addWidget(QtWidgets.QLabel("B2"), 0, 5)
-        hh.addWidget(QtWidgets.QLabel("B3"), 0, 6)
-        hh.addWidget(QtWidgets.QLabel("ASCII"), 0, 7)
+
+        # ✅ Master-Checkbox (tri-state) für Apply-Spalte
+        self.chkApplyAll = QtWidgets.QCheckBox()
+        self.chkApplyAll.setTristate(True)  # allows PartiallyChecked to reflect mixed state
+        self.chkApplyAll.setToolTip("Toggle all Apply checkboxes on/off")
+        self.chkApplyAll.stateChanged.connect(self._on_apply_all_toggled)
+        self._updating_master = False  # guard to avoid recursion when syncing master/rows
+
+        hh.addWidget(self.chkApplyAll, 0, 0, alignment=QtCore.Qt.AlignCenter)
+        hh.addWidget(QtWidgets.QLabel("Apply"), 0, 1)
+        hh.addWidget(QtWidgets.QLabel("Page"), 0, 2)
+        hh.addWidget(QtWidgets.QLabel("Name"), 0, 3)
+        hh.addWidget(QtWidgets.QLabel("B0"), 0, 4)
+        hh.addWidget(QtWidgets.QLabel("B1"), 0, 5)
+        hh.addWidget(QtWidgets.QLabel("B2"), 0, 6)
+        hh.addWidget(QtWidgets.QLabel("B3"), 0, 7)
+        hh.addWidget(QtWidgets.QLabel("ASCII"), 0, 8)
 
         # --- rows (scroll area) ---
         body = QtWidgets.QWidget()
@@ -272,6 +287,7 @@ class PageEditorDock(QtWidgets.QDockWidget):
             grid.addWidget(b2,    r, 5)
             grid.addWidget(b3,    r, 6)
             grid.addWidget(asc,   r, 7)
+            row.chkApply.stateChanged.connect(self._on_row_apply_changed)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -346,10 +362,14 @@ class PageEditorDock(QtWidgets.QDockWidget):
                         row.set_value(chunk, mark_changed=mark_changed)
                     off += 4
                     p += 1
+        if mark_changed:
+            self._recompute_master_checkbox()
+
 
     def clear_all_rows(self):
         for row in self._rows.values():
             row.clear()
+        self._recompute_master_checkbox()
 
     def gather_selected_pages(self) -> Dict[int, bytes]:
         """
@@ -402,10 +422,8 @@ class PageEditorDock(QtWidgets.QDockWidget):
         self.writePagesRequested.emit(payload)
 
     def _on_sim(self):
-        payload = {"pages": self.gather_selected_pages()}
-        if not payload["pages"]:
-            QtWidgets.QMessageBox.information(self, "Nothing to simulate", "No rows marked with 'Apply'.")
-            return
+        # Emit ALL pages, not just the checked ones
+        payload = {"pages": self.gather_all_pages()}
         self.simulateRequested.emit(payload)
 
     def _on_clear(self):
@@ -426,3 +444,76 @@ class PageEditorDock(QtWidgets.QDockWidget):
         )
         if ok and txt.strip().upper() == "RESET":
             self.deleteUserAreaRequested.emit()
+
+    def gather_all_pages(self) -> dict[int, bytes]:
+        """
+        Collect all rows regardless of 'Apply' checkbox.
+        Returns {page:int -> bytes(4)} for every page in the editor.
+        """
+        out = {}
+        for p in sorted(self._rows.keys()):
+            row = self._rows[p]
+            out[p] = row.value()
+        return out
+    
+    # ---------------- helper: apply-all toggle ----------------
+    def _on_apply_all_toggled(self, state: int):
+        """
+        Toggle all row checkboxes based on header checkbox.
+        Tri-state behavior:
+        - Checked   -> check all
+        - Unchecked -> uncheck all
+        - PartiallyChecked is set programmatically only; user click cycles to Checked.
+        """
+        if self._updating_master:
+            return  # ignore re-entrant changes from _recompute_master_checkbox
+
+        if state == QtCore.Qt.Checked:
+            target = True
+        elif state == QtCore.Qt.Unchecked:
+            target = False
+        else:
+            # If user somehow triggers PartiallyChecked, promote to Checked
+            target = True
+
+        # Apply to all rows
+        self._updating_master = True
+        try:
+            for row in self._rows.values():
+                row.chkApply.blockSignals(True)
+                row.chkApply.setChecked(target)
+                row.chkApply.blockSignals(False)
+        finally:
+            self._updating_master = False
+
+        # After mass toggle, ensure master is consistent (Checked/Unchecked)
+        self._recompute_master_checkbox()
+
+    def _on_row_apply_changed(self, _state: int):
+        """
+        When any row checkbox changes, recompute the master tri-state.
+        """
+        if self._updating_master:
+            return
+        self._recompute_master_checkbox()
+
+    def _recompute_master_checkbox(self):
+        """
+        Set master checkbox state based on how many rows are checked:
+        - none   -> Unchecked
+        - all    -> Checked
+        - mixed  -> PartiallyChecked
+        """
+        total = len(self._rows)
+        checked = sum(1 for r in self._rows.values() if r.chkApply.isChecked())
+
+        self._updating_master = True
+        try:
+            if checked == 0:
+                self.chkApplyAll.setCheckState(QtCore.Qt.Unchecked)
+            elif checked == total:
+                self.chkApplyAll.setCheckState(QtCore.Qt.Checked)
+            else:
+                self.chkApplyAll.setCheckState(QtCore.Qt.PartiallyChecked)
+        finally:
+            self._updating_master = False
