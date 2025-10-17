@@ -592,3 +592,240 @@ def write_anycubic_params(conn, *,
     results = {}
     # TODO: fill with write_bytes helpers similar to read_u16_at (use write_page_ultralight + little-endian packing)
     return results
+
+
+# --- Ergänzungen in anycubic_nfc_qt5/nfc/pcsc.py ---
+
+# Kleinere Hilfen
+def _cmd_read_page(page: int):
+    # MIFARE Ultralight/NTAG READ: 0x30, lese 16 Bytes (4 Pages)
+    return [0xFF, 0xB0, 0x00, page & 0xFF, 0x10]  # PC/SC direct-transmit variiert je nach Reader;
+                                                  # falls deine read_uid/read_anycubic_fields anders senden,
+                                                  # passe diesen Wrapper auf euren Transmit-Flow an.
+
+def _cmd_write_page(page: int, data4: bytes):
+    # MIFARE Ultralight/NTAG WRITE: 0xA2, 4 Bytes
+    data4 = (data4 or b"\x00\x00\x00\x00")[:4]
+    while len(data4) < 4:
+        data4 += b"\x00"
+    return [0xFF, 0xD6, 0x00, page & 0xFF, 0x04] + list(data4)
+
+def _tx(conn, apdu: list[int]):
+    data, sw1, sw2 = conn.transmit(apdu)
+    return bytes(data), sw1, sw2
+
+def read_single_page(conn, page: int) -> bytes:
+    """
+    Liest eine einzelne 4-Byte-Page robust, indem ein 16-Byte-READ (4 Pages) gemacht wird
+    und die relevante Page ausgeschnitten wird.
+    """
+    # 16-Byte-READ ab Start-Page-Gruppe
+    base = page & ~0x03
+    data, sw1, sw2 = _tx(conn, _cmd_read_page(base))
+    if sw1 != 0x90:
+        raise RuntimeError(f"READ failed for page 0x{page:02X}: SW1/SW2={sw1:02X}/{sw2:02X}")
+    off = (page & 0x03) * 4
+    chunk = bytes(data)[off:off+4]
+    if len(chunk) < 4:
+        chunk += b"\x00"*(4-len(chunk))
+    return chunk
+
+def detect_user_area(conn) -> dict:
+    """
+    Sehr konservative Heuristik für NTAG/Ultralight:
+    - Liefert dict: {"user_start": int, "user_end": int_exclusive, "protected": set_of_pages}
+    - Falls nicht ermittelbar, fällt zurück auf übliche NTAG213-Defaults.
+    """
+    info = {
+        "user_start": 0x04,   # oft ab 0x04 userdaten (nach header 0x00..0x03)
+        "user_end":   0x29,   # exklusiv, d. h. 0x04..0x28 (NTAG213 typisch ~0x29 Ende, 0x2A.. Lock/CFG)
+        "protected": set([0x00, 0x01, 0x02, 0x03,  # UID/LOCK/CFG Header
+                          0x2A, 0x2B, 0x2C, 0x2D]) # Lock/OTP/CFG (variiert je nach Tag)
+    }
+    try:
+        # Wenn du eine GET_VERSION/CC-Parser hast, nutze ihn hier um user_end dynamisch zu erkennen.
+        # Für jetzt: best-effort. Optional: lese CC bei 0x03 und leite Größe ab.
+        pass
+    except Exception:
+        pass
+    return info
+
+def write_raw_pages(conn, start_page: int, data_bytes: bytes, skip_protected: bool = True, delay_ms: int = 5):
+    """
+    Schreibt ab start_page die Daten byteweise über 4-Byte-Pages (0xA2).
+    Sicherheits-Geländer:
+      - skip_protected=True: überspringt bekannte kritische Pages automatisch
+      - respektiert detect_user_area()
+
+    Rückgabe:
+      dict {page:int -> True/False} pro tatsächlich geschriebenem Page-Versuch
+      oder {} wenn nichts zu schreiben war.
+    """
+    result = {}
+    buf = bytes(data_bytes or b"")
+    if len(buf) == 0:
+        return result
+
+    ua = detect_user_area(conn)
+    protected = set(ua.get("protected", set()))
+
+    # Auf 4-Byte Pages aufteilen
+    pages = (len(buf) + 3) // 4
+    for i in range(pages):
+        p = start_page + i
+        # 4-Byte-Scheibe
+        slice4 = buf[i*4:(i+1)*4]
+        if len(slice4) < 4:
+            slice4 += b"\x00"*(4-len(slice4))
+
+        # Schutz prüfen
+        if skip_protected and p in protected:
+            result[p] = False
+            continue
+        # optional: user-area begrenzen
+        user_start = ua.get("user_start", 0)
+        user_end = ua.get("user_end", 0x100)
+        if not (user_start <= p < user_end):
+            # außerhalb User-Bereich -> als "übersprungen/nicht erlaubt"
+            result[p] = False
+            continue
+
+        # tatsächlicher Write
+        try:
+            _, sw1, sw2 = _tx(conn, _cmd_write_page(p, slice4))
+            ok = (sw1 == 0x90)
+            result[p] = ok
+            if delay_ms:
+                QtCore.QThread.msleep(delay_ms)
+        except Exception:
+            result[p] = False
+
+    return result
+
+def clear_user_area(conn) -> dict:
+    """
+    Setzt die komplette User-Area (detect_user_area) auf 0x00.
+    Rückgabe: dict page->bool.
+    """
+    ua = detect_user_area(conn)
+    user_start = ua.get("user_start", 0x04)
+    user_end = ua.get("user_end", 0x29)
+    result = {}
+    for p in range(user_start, user_end):
+        try:
+            _, sw1, sw2 = _tx(conn, _cmd_write_page(p, b"\x00\x00\x00\x00"))
+            result[p] = (sw1 == 0x90)
+            QtCore.QThread.msleep(3)
+        except Exception:
+            result[p] = False
+    return result
+
+
+# --- Additions for raw page read/write and user-area clearing ---
+
+from PyQt5 import QtCore
+
+def _cmd_read_page_group(start_page: int):
+    """
+    PC/SC wrapper to read 4 pages (16 bytes) starting at start_page & ~0x03.
+    NOTE: Some readers expect native 0x30; adjust if your stack differs.
+    """
+    return [0xFF, 0xB0, 0x00, start_page & 0xFF, 0x10]
+
+def _cmd_write_single_page(page: int, data4: bytes):
+    """
+    PC/SC wrapper to write a single 4-byte page.
+    """
+    d = (data4 or b"\x00\x00\x00\x00")[:4]
+    while len(d) < 4:
+        d += b"\x00"
+    return [0xFF, 0xD6, 0x00, page & 0xFF, 0x04] + list(d)
+
+def _tx(conn, apdu: list):
+    data, sw1, sw2 = conn.transmit(apdu)
+    return bytes(data), sw1, sw2
+
+def read_single_page(conn, page: int) -> bytes:
+    """
+    Reads a single 4-byte page by issuing a 16-byte read for the page group.
+    """
+    base = page & ~0x03
+    data, sw1, sw2 = _tx(conn, _cmd_read_page_group(base))
+    if sw1 != 0x90:
+        raise RuntimeError(f"READ failed for page 0x{page:02X}: SW1/SW2={sw1:02X}/{sw2:02X}")
+    off = (page & 0x03) * 4
+    chunk = data[off:off+4]
+    if len(chunk) < 4:
+        chunk += b"\x00" * (4 - len(chunk))
+    return chunk
+
+def detect_user_area(conn) -> dict:
+    """
+    Conservative heuristic for NTAG/Ultralight tags.
+    Returns: {"user_start": int, "user_end": int_exclusive, "protected": set_of_pages}
+    """
+    info = {
+        "user_start": 0x04,   # typical after header 0x00..0x03
+        "user_end":   0x29,   # exclusive end (0x04..0x28)
+        "protected": set([0x00, 0x01, 0x02, 0x03, 0x2A, 0x2B, 0x2C, 0x2D]),
+    }
+    # TODO: read CC / GET_VERSION to determine exact size if needed
+    return info
+
+def write_raw_pages(conn, start_page: int, data_bytes: bytes, skip_protected: bool = True, delay_ms: int = 5):
+    """
+    Writes data_bytes across 4-byte pages starting at start_page.
+    Respects detect_user_area(); optionally skips protected pages.
+    Returns dict {page:int -> bool} for attempted writes.
+    """
+    result = {}
+    buf = bytes(data_bytes or b"")
+    if len(buf) == 0:
+        return result
+
+    ua = detect_user_area(conn)
+    protected = set(ua.get("protected", set()))
+    user_start = ua.get("user_start", 0x04)
+    user_end = ua.get("user_end", 0x29)
+
+    pages = (len(buf) + 3) // 4
+    for i in range(pages):
+        p = start_page + i
+        slice4 = buf[i*4:(i+1)*4]
+        if len(slice4) < 4:
+            slice4 += b"\x00" * (4 - len(slice4))
+
+        if not (user_start <= p < user_end):
+            result[p] = False
+            continue
+        if skip_protected and p in protected:
+            result[p] = False
+            continue
+
+        try:
+            _, sw1, sw2 = _tx(conn, _cmd_write_single_page(p, slice4))
+            ok = (sw1 == 0x90)
+            result[p] = ok
+            if delay_ms:
+                QtCore.QThread.msleep(delay_ms)
+        except Exception:
+            result[p] = False
+
+    return result
+
+def clear_user_area(conn) -> dict:
+    """
+    Clears the entire user area to 0x00. Returns dict page->bool.
+    """
+    ua = detect_user_area(conn)
+    user_start = ua.get("user_start", 0x04)
+    user_end = ua.get("user_end", 0x29)
+    result = {}
+    for p in range(user_start, user_end):
+        try:
+            _, sw1, sw2 = _tx(conn, _cmd_write_single_page(p, b"\x00\x00\x00\x00"))
+            result[p] = (sw1 == 0x90)
+            QtCore.QThread.msleep(3)
+        except Exception:
+            result[p] = False
+    return result

@@ -1,12 +1,18 @@
 # tests/ntag_dump.py
 # Dump Type-2 tag pages (NTAG/Ultralight family) via PC/SC (FF B0 00 <page> 04).
-# - Reads pages 0..47 (48 pages), saves binary to ntag_dump.bin and prints a human view.
+# - Reads a configurable page range and writes it to a binary file.
+# - Prints a human-friendly view (HEX + ASCII) for each page.
 # - Run while a tag is on the reader.
 
 from __future__ import annotations
 import sys
-import binascii
-from anycubic_nfc_qt5.nfc.pcsc import list_readers, connect_first_reader, read_page_ultralight
+import argparse
+from anycubic_nfc_qt5.nfc.pcsc import (
+    list_readers,
+    connect_first_reader,
+    read_single_page,   # 4 bytes per page
+)
+from smartcard.Exceptions import NoCardException
 
 def fmt_hex(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
@@ -14,9 +20,22 @@ def fmt_hex(b: bytes) -> str:
 def fmt_ascii(b: bytes) -> str:
     return "".join(chr(x) if 32 <= x < 127 else "." for x in b)
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Dump NTAG/Ultralight pages via PC/SC.")
+    p.add_argument("--start", type=int, default=0, help="Start page (default: 0)")
+    p.add_argument("--end",   type=int, default=47, help="End page inclusive (default: 47)")
+    p.add_argument("--outfile", default="ntag_dump.bin", help="Output binary filename (default: ntag_dump.bin)")
+    return p.parse_args()
+
 def main():
-    r = list_readers()
-    if not r:
+    args = parse_args()
+
+    if args.start < 0 or args.end < args.start:
+        print("[ERROR] Invalid range. Ensure 0 <= start <= end.")
+        sys.exit(1)
+
+    readers = list_readers()
+    if not readers:
         print("[ERROR] No PC/SC reader found.")
         sys.exit(1)
 
@@ -26,39 +45,41 @@ def main():
         sys.exit(1)
 
     try:
-        conn.connect()
-    except Exception as e:
-        print("[ERROR] No card present or connect failed:", e)
-        sys.exit(1)
+        try:
+            conn.connect()
+        except NoCardException:
+            print("[ERROR] No card present. Place a tag on the reader.")
+            sys.exit(1)
 
-    pages = []
-    MAX_PAGE = 47  # read pages 0..47 (adjust if needed)
-    for p in range(0, MAX_PAGE + 1):
-        b = read_page_ultralight(conn, p)
-        if b is None:
-            print(f"{p:02d}: READ ERROR")
-            # stop on read error or continue? we continue to show what we have
-            pages.append(None)
-        else:
-            pages.append(b)
-            print(f"{p:02d}: {fmt_hex(b)}   |{fmt_ascii(b)}|")
+        pages: list[bytes | None] = []
+        for p in range(args.start, args.end + 1):
+            try:
+                data4 = read_single_page(conn, p)  # -> bytes(4)
+            except Exception as e:
+                print(f"{p:02d}: READ ERROR ({e})")
+                data4 = None
+            if data4 is None:
+                print(f"{p:02d}: READ ERROR")
+                pages.append(None)
+            else:
+                print(f"{p:02d}: {fmt_hex(data4)}   |{fmt_ascii(data4)}|")
+                pages.append(data4)
 
-    # save binary (concatenate all readable pages)
-    out = bytearray()
-    for b in pages:
-        if b is None:
-            out.extend(b"\x00\x00\x00\x00")  # placeholder
-        else:
-            out.extend(b)
-    fn = "ntag_dump.bin"
-    with open(fn, "wb") as f:
-        f.write(out)
-    print(f"\nSaved {len(out)} bytes to {fn}")
+        # Save binary (concatenate pages; missing pages become 00 00 00 00)
+        out = bytearray()
+        for b in pages:
+            out.extend(b if b is not None else b"\x00\x00\x00\x00")
+        with open(args.outfile, "wb") as f:
+            f.write(out)
 
-    try:
-        conn.disconnect()
-    except Exception:
-        pass
+        print(f"\nSaved {len(out)} bytes to {args.outfile}")
+
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
+    
