@@ -231,15 +231,24 @@ class PageEditorDock(QtWidgets.QDockWidget):
         self.btnClear = QtWidgets.QPushButton("CLEAR")
         self.btnDelete = QtWidgets.QPushButton("DELETE (User Area)")
         self.btnDelete.setStyleSheet("color:#a00;")
+        self.btnMarkChanged = QtWidgets.QPushButton("Mark Changed")
+        self.btnMarkKnown = QtWidgets.QPushButton("Mark Known Fields")
+
 
         self.btnWrite.setToolTip("Write only marked pages to NFC-Tag")
         self.btnSim.setToolTip("Log binary pages in log window")
         self.btnClear.setToolTip("Clear all user area pages to 0x00")
         self.btnDelete.setToolTip("Dangerours - delete user area on NFC-Tag and write 0x00")
+        self.btnMarkKnown.setToolTip("Mark only currently well known pages")
+        self.btnMarkChanged.setToolTip("Mark only changed pages")
+
 
         h.addWidget(self.btnWrite)
         h.addStretch()
         h.addWidget(self.btnSim)
+        h.addStretch()
+        h.addWidget(self.btnMarkChanged)
+        h.addWidget(self.btnMarkKnown)
         h.addStretch()
         h.addWidget(self.btnClear)
         h.addWidget(self.btnDelete)
@@ -308,6 +317,9 @@ class PageEditorDock(QtWidgets.QDockWidget):
         self.btnSim.clicked.connect(self._on_sim)
         self.btnClear.clicked.connect(self._on_clear)
         self.btnDelete.clicked.connect(self._on_delete)
+        self.btnMarkChanged.clicked.connect(self._on_mark_changed)
+        self.btnMarkKnown.clicked.connect(self._on_mark_known)
+
 
     # ---------------- public API ----------------
 
@@ -455,7 +467,22 @@ class PageEditorDock(QtWidgets.QDockWidget):
             row = self._rows[p]
             out[p] = row.value()
         return out
-    
+
+    def _on_mark_changed(self):
+        """Mark all rows that contain non-zero data."""
+        for row in self._rows.values():
+            data = row.get_bytes4()
+            nonzero = any(b != 0x00 for b in data)
+            row.chkApply.setChecked(nonzero)
+        self._recompute_master_checkbox()
+
+    def _on_mark_known(self):
+        """Mark all rows that correspond to known Anycubic fields."""
+        known_pages = set(PAGE_NAME_MAP.keys())
+        for page, row in self._rows.items():
+            row.chkApply.setChecked(page in known_pages)
+        self._recompute_master_checkbox()
+
     # ---------------- helper: apply-all toggle ----------------
     def _on_apply_all_toggled(self, state: int):
         """
