@@ -9,11 +9,12 @@ include_files = [
 ]
 
 build_exe_options = dict(
-    excludes=["tkinter", "tests"],
-    includes=["PyQt5", "smartcard"],
+    excludes=["tkinter", "tests", "unittest"],
+    includes=["PyQt5", "smartcard", "logging", "json", "pathlib"], 
     packages=["os", "sys", "anycubic_nfc_qt5"],
     include_files=include_files,
     optimize=1,
+    silent_level=1,
 )
 
 # inside setup(..., options={"bdist_mac": {...}})
