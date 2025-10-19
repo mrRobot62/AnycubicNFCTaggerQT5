@@ -2,10 +2,12 @@
 NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubic #filament #nfc
 
 # Releases
+## V0.3.1
+Release Candidate. More information see release docu
 ## V0.3.0
-Release Candidate. See release downloads
+Release Candidate. More information see release docu
 ## V0.2.0
-first stable release. See release downloads
+first stable release. More information see release docu
 
 ## No NFC-Reader found 
 - initial screen, reader not connected via USB
