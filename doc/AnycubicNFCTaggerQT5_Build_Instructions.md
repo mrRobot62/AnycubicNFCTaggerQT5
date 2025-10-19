@@ -42,9 +42,9 @@ Then run:
 - Generates a `.dmg` in `dist/` using your `packaging/macos/dmg_settings.py`.
 
 ### 5. Output
-| File | Description |
-|------|--------------|
-| `build/AnycubicNFCTaggerQT5.app` | The application bundle |
+| File                                            | Description                       |
+| ----------------------------------------------- | --------------------------------- |
+| `build/AnycubicNFCTaggerQT5.app`                | The application bundle            |
 | `dist/AnycubicNFCTaggerQT5-<version>-arm64.dmg` | macOS disk image for distribution |
 
 ### 6. Optional (signing and notarization)
@@ -72,10 +72,10 @@ build_exe.bat
 ```
 
 ### 4. Optional environment variables
-| Variable | Description | Example |
-|-----------|-------------|----------|
-| `PYTHON_BIN` | Path to specific Python executable | `set PYTHON_BIN=C:\Python312\python.exe` |
-| `DO_MSI` | Disable MSI build (set to `0` to skip) | `set DO_MSI=0` |
+| Variable     | Description                            | Example                                  |
+| ------------ | -------------------------------------- | ---------------------------------------- |
+| `PYTHON_BIN` | Path to specific Python executable     | `set PYTHON_BIN=C:\Python312\python.exe` |
+| `DO_MSI`     | Disable MSI build (set to `0` to skip) | `set DO_MSI=0`                           |
 
 ### 5. What it does
 - Ensures Python and `cx_Freeze` are installed.
@@ -85,9 +85,9 @@ build_exe.bat
 - Optionally runs `freeze_setup.py bdist_msi` to create an installer.
 
 ### 6. Output
-| File | Description |
-|------|--------------|
-| `build\AnycubicNFCTaggerQT5.exe` | Portable executable |
+| File                                      | Description                |
+| ----------------------------------------- | -------------------------- |
+| `build\AnycubicNFCTaggerQT5.exe`          | Portable executable        |
 | `dist\AnycubicNFCTaggerQT5-<version>.msi` | Optional Windows installer |
 
 ---
@@ -102,13 +102,15 @@ build_exe.bat
 
 ## 📂 Summary
 
-| Platform | Script | Output | Toolchain |
-|-----------|---------|---------|------------|
-| macOS | `build_dmg.sh` | `.app`, `.dmg` | `cx_Freeze` + `dmgbuild` |
-| Windows | `build_exe.bat` | `.exe`, `.msi` | `cx_Freeze` |
+| Platform | Script          | Output         | Toolchain                |
+| -------- | --------------- | -------------- | ------------------------ |
+| macOS    | `build_dmg.sh`  | `.app`, `.dmg` | `cx_Freeze` + `dmgbuild` |
+| Windows  | `build_exe.bat` | `.exe`, `.msi` | `cx_Freeze`              |
 
 ---
 
 **Author:** Bernhard Klein  
 **Project:** AnycubicNFCTaggerQT5  
 **Last Updated:** 2025‑10‑17
+
+
