@@ -1,6 +1,9 @@
 # AnycubicNFCTaggerQT5
 NFC-Chip tagger for Filament-Roles. Read existing tags, write new tags. #anycubic #filament #nfc
 
+Parallel to this project I made a deep research how Anycubic SKU are working. If you're interested in please take a look into my second project 
+[Sniffing Anycubic SKUs](https://github.com/mrRobot62/anycubic_filament_sku_sniffer)
+
 # Releases
 ## V0.3.0
 Release Candidate. See release downloads
